@@ -1,0 +1,38 @@
+# --- Python Virtual Environments ---
+.venv/
+venv/
+env/
+bin/
+lib/
+include/
+share/
+pyvenv.cfg
+
+# --- Claude Code / Anthropic ---
+.claude/
+claude_code.log
+.anthropic/
+
+# --- Claude Memory Files ---
+# Note: Check these in if you want team members to share the same context.
+CLAUDE.md
+CLAUDE.local.md
+
+# --- Python Build & Cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+*.egg-info/
+
+# --- Environment Variables ---
+.env
+.flaskenv
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
+nul
