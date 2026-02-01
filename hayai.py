@@ -1,14 +1,18 @@
 import pygame
 from pygame.locals import *
+import argparse
 import json
 import math
 import os
+import re
 import sys
 import time
 import ctypes
+import uuid
+import numpy as np
 from tkinter import Tk, filedialog, messagebox
 from dataclasses import dataclass, field
-from typing import List, Tuple, Optional, Union, TYPE_CHECKING
+from typing import List, Tuple, Optional, Union, Dict, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import TypeAlias
@@ -33,6 +37,28 @@ except ImportError:
     messagebox.showerror("Missing Dependency", "PyOpenGL is required to run this application.\n\nInstall it with: pip install PyOpenGL PyOpenGL-accelerate")
     root.destroy()
     sys.exit(1)
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None  # Video support disabled
+
+# Desktop capture dependencies (mss for screen capture, pywin32 for overlay windows)
+try:
+    import mss
+    import win32gui
+    import win32con
+    import win32api
+    DESKTOP_CAPTURE_AVAILABLE = True
+except ImportError:
+    DESKTOP_CAPTURE_AVAILABLE = False
+
+# Video pipe support (Spout on Windows)
+try:
+    import SpoutGL
+    VIDEOPIPE_AVAILABLE = True
+except ImportError:
+    VIDEOPIPE_AVAILABLE = False
 
 # Fix Windows DPI scaling issues - must be called before pygame.init()
 if sys.platform == 'win32':
@@ -73,6 +99,115 @@ GROUP_MEMBER_TINT = (180, 160, 100)      # Dimmer outline for shapes in selected
 MARCH_SPEED = 100  # Pixels per second
 MARCH_DASH = 6     # Dash length
 MARCH_GAP = 4      # Gap length
+
+# Tooltip settings
+TOOLTIP_DELAY = 0.5  # Seconds before showing tooltip
+TOOLTIP_BG_COLOR = (50, 50, 55)
+TOOLTIP_BORDER_COLOR = (100, 100, 110)
+TOOLTIP_TEXT_COLOR = (255, 255, 255)
+
+
+def draw_dashed_line(surface, color, start: Tuple[float, float], end: Tuple[float, float],
+                     dash_length: int = 6, gap_length: int = 4, width: int = 1,
+                     offset: float = 0.0):
+    """
+    Draw a dashed line between two points.
+
+    Args:
+        surface: Pygame surface to draw on
+        color: Line color (RGB tuple)
+        start: Start point (x, y)
+        end: End point (x, y)
+        dash_length: Length of each dash in pixels
+        gap_length: Length of gap between dashes in pixels
+        width: Line width in pixels
+        offset: Animation offset for marching ants effect (0 = no animation)
+    """
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.sqrt(dx * dx + dy * dy)
+    if length == 0:
+        return
+    dx /= length
+    dy /= length
+
+    pos = -offset
+    while pos < length:
+        dash_start = max(0, pos)
+        dash_end = min(pos + dash_length, length)
+        if dash_end > 0 and dash_start < length:
+            x1 = start[0] + dx * dash_start
+            y1 = start[1] + dy * dash_start
+            x2 = start[0] + dx * dash_end
+            y2 = start[1] + dy * dash_end
+            pygame.draw.line(surface, color, (int(x1), int(y1)), (int(x2), int(y2)), width)
+        pos += dash_length + gap_length
+
+
+def draw_tooltip_at_cursor(surface, font, text: str, scale: float = 1.0):
+    """
+    Draw a tooltip near the cursor position.
+
+    Args:
+        surface: Pygame surface to draw on
+        font: Font to render text with
+        text: Tooltip text to display
+        scale: UI scale factor for sizing
+    """
+    padding = int(6 * scale)
+    margin = int(5 * scale)
+    cursor_offset = int(16 * scale)
+
+    text_surf = font.render(text, True, TOOLTIP_TEXT_COLOR)
+    tooltip_w = text_surf.get_width() + padding * 2
+    tooltip_h = text_surf.get_height() + padding * 2
+
+    # Position tooltip below and to the right of cursor
+    mouse_x, mouse_y = pygame.mouse.get_pos()
+    tooltip_x = mouse_x + cursor_offset
+    tooltip_y = mouse_y + cursor_offset
+
+    # Keep tooltip on screen
+    screen_w, screen_h = surface.get_size()
+    if tooltip_x + tooltip_w > screen_w - margin:
+        tooltip_x = mouse_x - tooltip_w - margin
+    if tooltip_y + tooltip_h > screen_h - margin:
+        tooltip_y = mouse_y - tooltip_h - margin
+
+    # Draw tooltip background
+    tooltip_rect = pygame.Rect(tooltip_x, tooltip_y, tooltip_w, tooltip_h)
+    border_radius = int(4 * scale)
+    pygame.draw.rect(surface, TOOLTIP_BG_COLOR, tooltip_rect, border_radius=border_radius)
+    pygame.draw.rect(surface, TOOLTIP_BORDER_COLOR, tooltip_rect, 1, border_radius=border_radius)
+    surface.blit(text_surf, (tooltip_x + padding, tooltip_y + padding))
+
+
+def update_panel_animation(panel) -> None:
+    """
+    Update collapsible panel animation state.
+
+    Shared helper for ScenePanel and ImageryPanel animation.
+    Panel must have: animating, animation_start, animation_duration,
+                     collapsed, animation_progress attributes.
+    """
+    if not panel.animating:
+        return
+
+    elapsed = time.time() - panel.animation_start
+    t = min(1.0, elapsed / panel.animation_duration)
+
+    # Ease-out: 1 - (1 - t)^2
+    eased = 1 - (1 - t) ** 2
+
+    if panel.collapsed:
+        panel.animation_progress = 1.0 - eased
+    else:
+        panel.animation_progress = eased
+
+    if t >= 1.0:
+        panel.animating = False
+        panel.animation_progress = 0.0 if panel.collapsed else 1.0
+
 
 # Default grid pattern surface
 def create_grid_pattern(width, height, grid_size=20):
@@ -211,7 +346,6 @@ vec2 inversebilinear(vec2 p, vec2 v0, vec2 v1, vec2 v2, vec2 v3) {
     return s;
 }
 
-
 // Apply perspective-correct texture coordinate transformation
 vec2 perspectiveCorrectUV(vec2 uv, float px, float py) {
     // Calculate virtual depth (w) at each corner based on perspective values
@@ -246,28 +380,6 @@ vec2 perspectiveCorrectUV(vec2 uv, float px, float py) {
     }
     return uv;
 }
-/*
-// Apply perspective-correct texture coordinate transformation
-vec2 perspectiveCorrectUVOLD(vec2 uv, float px, float py) {
-    // Perspective correct equation.
-    // From http://en.wikipedia.org/wiki/Texture_mapping#Perspective_correctness
-    // The equation is identical for U and V, so we only show the U one below.
-    //ualpha = (((1-alpha)*(u0/z0)) + ((alpha)*(u1/z1))) /;
-    //         (((1-alpha)*(1.0/z0)) + ((alpha)*(1.0/z1)));
-
-    // Abuse the equation above to apply as a simple user
-    // controllable warping amount.
-    // We do this by pretending the z value at u0 is just one and
-    // giving the user control of the z value at u1.
-    // We use vector ops to do this on U and V at the same timeS.
-    vec2 warpPerspXY = vec2(px, py);
-    vec2 warpUV = warpPerspXY;//vec2(0.5, 0.5);
-    vec2 posUVWarped =
-        ((uv)*(1.0/warpUV)) /
-        (((vec2(1.0, 1.0)-uv)) + ((uv)*(1.0/warpUV)));
-    return posUVWarped;
-}
-*/
 
 //----------------------------------------------------------------------------
 // HSV color conversion functions
@@ -348,18 +460,11 @@ class GLRenderer:
         self.vao = None
         self.vbo = None
         self.textures = {}
-        self.u_screen_size = -1
-        self.u_p0 = -1
-        self.u_p1 = -1
-        self.u_p2 = -1
-        self.u_p3 = -1
-        self.u_texture = -1
-        self.u_perspective_x = -1
-        self.u_perspective_y = -1
-        self.u_shape_alpha = -1
-        self.u_hue_shift = -1
-        self.u_sat_mult = -1
-        self.u_val_mult = -1
+        # Reset all uniform locations to invalid
+        for attr in ('u_screen_size', 'u_p0', 'u_p1', 'u_p2', 'u_p3', 'u_texture',
+                      'u_perspective_x', 'u_perspective_y', 'u_shape_alpha',
+                      'u_hue_shift', 'u_sat_mult', 'u_val_mult'):
+            setattr(self, attr, -1)
 
     def _compile_shader(self, source, shader_type):
         """Compile a shader and return its ID"""
@@ -735,16 +840,16 @@ def triangulate_polygon(vertices):
 class Shape:
     contour: List[Tuple[float, float]] = field(default_factory=list)
     warp_points: List[Tuple[float, float]] = field(default_factory=list)
-    image_path: Optional[str] = None
-    image_surface: Optional[pygame.Surface] = None
+    # Imagery reference (links to ImageryManager item)
+    imagery_ref: Optional[str] = None  # ID of referenced ImageryItem
+    frame_offset_percent: float = 0.0  # Animation sync offset (0-100%)
+    _last_rendered_frame: int = field(default=-1, repr=False)  # Track for texture dirty flag
+    # Legacy fields for backward compatibility during migration
+    image_path: Optional[str] = None  # Deprecated: use imagery_ref
+    # Perspective warp
     perspective_x: float = 0.0  # Perspective warp strength on Y axis (vertical keystone)
     perspective_y: float = 0.0  # Perspective warp strength on X axis (horizontal keystone)
     perspective_axis: int = 0  # 0 = Y (vertical), 1 = X (horizontal)
-    # Animation support
-    animation_frames: List[pygame.Surface] = field(default_factory=list)
-    frame_durations: List[float] = field(default_factory=list)
-    current_frame: int = 0
-    last_frame_time: float = 0
     # OpenGL texture cache
     gl_texture_id: int = 0
     gl_texture_dirty: bool = True
@@ -760,8 +865,6 @@ class Shape:
     hue_shift: float = 0.0  # Hue rotation in degrees (0-360)
     saturation: float = 1.0  # Saturation multiplier (0.0-2.0, 1.0 = normal)
     color_value: float = 1.0  # Brightness/value multiplier (0.0-2.0, 1.0 = normal)
-    # Animation control
-    playback_speed: float = 1.0  # Animation speed multiplier (1.0 = normal)
     # Transform pivot (frozen during vertex editing to prevent center drift)
     _frozen_pivot: Optional[Tuple[float, float]] = field(default=None, repr=False)
     # Hierarchy parent reference (for Group transforms)
@@ -771,36 +874,25 @@ class Shape:
         if not self.warp_points and len(self.contour) >= 3:
             self.fit_warp_to_contour()
 
-    def get_current_image(self):
-        """Get the current frame for animated images, or the static image"""
-        if self.animation_frames and len(self.animation_frames) > 0:
-            current_time = time.time()
-            # Initialize last_frame_time if it's 0 (not yet set)
-            if self.last_frame_time == 0:
-                self.last_frame_time = current_time
-
-            # Get frame duration, default to 100ms if not available
-            if self.frame_durations and self.current_frame < len(self.frame_durations):
-                frame_duration = self.frame_durations[self.current_frame]
-            else:
-                frame_duration = 0.1
-
-            # Apply playback speed (higher = faster, so divide duration)
-            effective_duration = frame_duration / max(0.1, self.playback_speed)
-
-            # Check if it's time to advance to the next frame
-            elapsed = current_time - self.last_frame_time
-            if elapsed >= effective_duration:
-                self.last_frame_time = current_time
-                old_frame = self.current_frame
-                self.current_frame = (self.current_frame + 1) % len(self.animation_frames)
-                if old_frame != self.current_frame:
-                    self.gl_texture_dirty = True  # Mark for texture update
-
-            # Ensure current_frame is valid
-            self.current_frame = self.current_frame % len(self.animation_frames)
-            return self.animation_frames[self.current_frame]
-        return self.image_surface
+    def get_current_image(self, imagery_manager: Optional['ImageryManager'] = None) -> Optional[pygame.Surface]:
+        """
+        Get the current image/frame to display.
+        If imagery_ref is set and imagery_manager provided, gets from the centralized imagery.
+        Returns the surface to render, or None if no imagery assigned.
+        """
+        if self.imagery_ref and imagery_manager:
+            item = imagery_manager.get_item(self.imagery_ref)
+            if item:
+                if item.is_animated():
+                    img, frame_idx = item.get_frame_at_offset(self.frame_offset_percent)
+                    # Track frame changes for texture updates
+                    if frame_idx != self._last_rendered_frame:
+                        self.gl_texture_dirty = True
+                        self._last_rendered_frame = frame_idx
+                    return img
+                else:
+                    return item.image_surface
+        return None  # No imagery assigned - will use DEFAULT_PATTERN
 
     def get_bounds(self):
         if not self.contour:
@@ -931,14 +1023,10 @@ class Shape:
     def _get_world_rotation(self):
         """Get accumulated world rotation including parent chain."""
         rotation = self.rotation
-        if self._parent is not None:
-            # Get parent's world rotation
-            _, _, _, _, _ = self._parent.get_world_transform_matrix()
-            # Accumulate rotations
-            parent = self._parent
-            while parent is not None:
-                rotation += parent.rotation
-                parent = parent._parent
+        parent = self._parent
+        while parent is not None:
+            rotation += parent.rotation
+            parent = parent._parent
         return rotation
 
     def _get_world_scale(self):
@@ -1153,6 +1241,39 @@ class Shape:
             self.last_frame_time = time.time()
             self.gl_texture_dirty = True  # Mark texture for refresh
 
+            # Check for video files
+            video_extensions = ('.avi', '.mov', '.mp4')
+            if path.lower().endswith(video_extensions):
+                if cv2 is None:
+                    return "OpenCV not installed - video support unavailable"
+
+                cap = cv2.VideoCapture(path)
+                if not cap.isOpened():
+                    return "Failed to open video file"
+
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                frame_duration = 1.0 / fps
+
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    # Convert BGR to RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    # Create pygame surface
+                    surface = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
+                    surface = surface.convert_alpha()
+                    self.animation_frames.append(surface)
+                    self.frame_durations.append(frame_duration)
+
+                cap.release()
+
+                if not self.animation_frames:
+                    return "No frames extracted from video"
+
+                self.image_surface = self.animation_frames[0]
+                return None  # Success
+
             # Check for animated GIF
             if path.lower().endswith('.gif'):
                 pil_image = Image.open(path)
@@ -1210,7 +1331,12 @@ class Shape:
         return {
             'contour': self.contour,
             'warp_points': self.warp_points,
+            # Imagery reference
+            'imagery_ref': self.imagery_ref,
+            'frame_offset_percent': self.frame_offset_percent,
+            # Legacy field kept for backward compatibility
             'image_path': self.image_path,
+            # Perspective warp
             'perspective_x': self.perspective_x,
             'perspective_y': self.perspective_y,
             'perspective_axis': self.perspective_axis,
@@ -1226,8 +1352,6 @@ class Shape:
             'hue_shift': self.hue_shift,
             'saturation': self.saturation,
             'color_value': self.color_value,
-            # Animation control
-            'playback_speed': self.playback_speed,
         }
 
     @classmethod
@@ -1235,7 +1359,12 @@ class Shape:
         shape = cls(
             contour=[tuple(p) for p in data.get('contour', [])],
             warp_points=[tuple(p) for p in data.get('warp_points', [])],
+            # Imagery reference
+            imagery_ref=data.get('imagery_ref'),
+            frame_offset_percent=data.get('frame_offset_percent', 0.0),
+            # Legacy field for migration
             image_path=data.get('image_path'),
+            # Perspective warp
             perspective_x=data.get('perspective_x', 0.0),
             perspective_y=data.get('perspective_y', 0.0),
             perspective_axis=data.get('perspective_axis', 0),
@@ -1251,11 +1380,8 @@ class Shape:
             hue_shift=data.get('hue_shift', 0.0),
             saturation=data.get('saturation', 1.0),
             color_value=data.get('color_value', 1.0),
-            # Animation control
-            playback_speed=data.get('playback_speed', 1.0),
         )
-        if shape.image_path and os.path.exists(shape.image_path):
-            shape.load_image(shape.image_path)
+        # Note: image_path loading is handled during scene migration in load_scene
         return shape
 
 
@@ -1491,6 +1617,1011 @@ class Group:
         return group
 
 
+# ============================================================================
+# Desktop Capture Overlay Window (Windows only)
+# ============================================================================
+
+if DESKTOP_CAPTURE_AVAILABLE:
+    # Windows message constants for move/resize modal loop
+    WM_ENTERSIZEMOVE = 0x0231
+    WM_EXITSIZEMOVE = 0x0232
+    WM_TIMER = 0x0113
+
+    # user32 functions for timer management (not in win32gui)
+    _user32 = ctypes.windll.user32
+    _user32.SetTimer.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_void_p]
+    _user32.SetTimer.restype = ctypes.c_size_t
+    _user32.KillTimer.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    _user32.KillTimer.restype = ctypes.c_bool
+
+    class DesktopOverlayWindow:
+        """Transparent overlay window for desktop region selection."""
+
+        _wnd_class_registered = False
+        _wnd_class_name = "HayaiCaptureOverlay"
+        _instances: Dict[int, 'DesktopOverlayWindow'] = {}
+
+        _CAPTURE_TIMER_ID = 1
+        _CAPTURE_TIMER_INTERVAL = 16  # ~60fps in milliseconds
+
+        def __init__(self, x: int, y: int, width: int, height: int,
+                     border_color: Tuple[int, int, int] = (0, 255, 0)):
+            self.x = x
+            self.y = y
+            self.width = width
+            self.height = height
+            self.border_color = border_color
+            self.border_width = 4
+            self.hwnd = None
+            self.visible = False
+            self._on_move_callback = None
+            self._on_resize_callback = None
+            self._on_capture_callback = None
+            self._in_modal_loop = False
+
+            if not DesktopOverlayWindow._wnd_class_registered:
+                self._register_window_class()
+
+            self._create_window()
+
+            if self.hwnd:
+                DesktopOverlayWindow._instances[self.hwnd] = self
+
+        # Message handler lookup table (populated after class definition)
+        _msg_handlers = None
+
+        @staticmethod
+        def _wndproc_dispatch(hwnd, msg, wparam, lparam):
+            """Static window procedure that dispatches to the correct instance."""
+            instance = DesktopOverlayWindow._instances.get(hwnd)
+            if instance:
+                handler_name = DesktopOverlayWindow._msg_handlers.get(msg)
+                if handler_name:
+                    handler = getattr(instance, handler_name)
+                    return handler(hwnd, msg, wparam, lparam)
+            return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+        def _register_window_class(self):
+            """Register the window class for overlay windows."""
+            wc = win32gui.WNDCLASS()
+            wc.style = win32con.CS_HREDRAW | win32con.CS_VREDRAW
+            wc.lpfnWndProc = DesktopOverlayWindow._wndproc_dispatch
+            wc.hInstance = win32api.GetModuleHandle(None)
+            wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+            wc.hbrBackground = 0
+            wc.lpszClassName = self._wnd_class_name
+
+            try:
+                win32gui.RegisterClass(wc)
+                DesktopOverlayWindow._wnd_class_registered = True
+            except Exception:
+                pass  # Class may already be registered
+
+        def _create_window(self):
+            """Create the overlay window."""
+            ex_style = (win32con.WS_EX_LAYERED |
+                       win32con.WS_EX_TOPMOST |
+                       win32con.WS_EX_TOOLWINDOW)
+            style = win32con.WS_POPUP
+
+            self.hwnd = win32gui.CreateWindowEx(
+                ex_style,
+                self._wnd_class_name,
+                "Desktop Capture Region",
+                style,
+                self.x, self.y, self.width, self.height,
+                0, 0, win32api.GetModuleHandle(None), None
+            )
+
+            # Use alpha transparency so interior receives mouse events
+            win32gui.SetLayeredWindowAttributes(
+                self.hwnd, 0, 40, win32con.LWA_ALPHA
+            )
+
+        def _on_destroy(self, hwnd, msg, wparam, lparam):
+            return 0
+
+        def _on_paint(self, hwnd, msg, wparam, lparam):
+            """Draw the overlay with border and semi-transparent fill."""
+            hdc, ps = win32gui.BeginPaint(hwnd)
+            rect = win32gui.GetClientRect(hwnd)
+
+            # Fill interior with dark color
+            fill_brush = win32gui.CreateSolidBrush(win32api.RGB(30, 30, 30))
+            win32gui.FillRect(hdc, rect, fill_brush)
+            win32gui.DeleteObject(fill_brush)
+
+            # Create pen for border
+            pen = win32gui.CreatePen(
+                win32con.PS_SOLID,
+                self.border_width,
+                win32api.RGB(*self.border_color)
+            )
+            old_pen = win32gui.SelectObject(hdc, pen)
+            old_brush = win32gui.SelectObject(hdc, win32gui.GetStockObject(win32con.NULL_BRUSH))
+
+            # Draw rectangle border
+            win32gui.Rectangle(hdc, rect[0], rect[1], rect[2], rect[3])
+
+            # Draw corner handles
+            handle_size = 12
+            handle_brush = win32gui.CreateSolidBrush(win32api.RGB(255, 255, 255))
+            old_handle_brush = win32gui.SelectObject(hdc, handle_brush)
+
+            corners = [
+                (rect[0], rect[1]),
+                (rect[2] - handle_size, rect[1]),
+                (rect[0], rect[3] - handle_size),
+                (rect[2] - handle_size, rect[3] - handle_size),
+            ]
+            for cx, cy in corners:
+                win32gui.Rectangle(hdc, cx, cy, cx + handle_size, cy + handle_size)
+
+            # Cleanup
+            win32gui.SelectObject(hdc, old_pen)
+            win32gui.SelectObject(hdc, old_brush)
+            win32gui.SelectObject(hdc, old_handle_brush)
+            win32gui.DeleteObject(pen)
+            win32gui.DeleteObject(handle_brush)
+            win32gui.EndPaint(hwnd, ps)
+            return 0
+
+        def _on_nchittest(self, hwnd, msg, wparam, lparam):
+            """Handle hit testing for drag and resize."""
+            x = ctypes.c_short(lparam & 0xFFFF).value
+            y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
+
+            rect = win32gui.GetWindowRect(hwnd)
+            cx = x - rect[0]
+            cy = y - rect[1]
+            w = rect[2] - rect[0]
+            h = rect[3] - rect[1]
+
+            border = 12
+
+            # Check corners first
+            if cx < border and cy < border:
+                return win32con.HTTOPLEFT
+            if cx >= w - border and cy < border:
+                return win32con.HTTOPRIGHT
+            if cx < border and cy >= h - border:
+                return win32con.HTBOTTOMLEFT
+            if cx >= w - border and cy >= h - border:
+                return win32con.HTBOTTOMRIGHT
+
+            # Check edges
+            if cy < border:
+                return win32con.HTTOP
+            if cy >= h - border:
+                return win32con.HTBOTTOM
+            if cx < border:
+                return win32con.HTLEFT
+            if cx >= w - border:
+                return win32con.HTRIGHT
+
+            # Interior - allow dragging
+            return win32con.HTCAPTION
+
+        def _on_move(self, hwnd, msg, wparam, lparam):
+            """Handle window move."""
+            rect = win32gui.GetWindowRect(hwnd)
+            self.x = rect[0]
+            self.y = rect[1]
+            if self._on_move_callback:
+                self._on_move_callback(self.x, self.y)
+            return 0
+
+        def _on_size(self, hwnd, msg, wparam, lparam):
+            """Handle window resize."""
+            rect = win32gui.GetWindowRect(hwnd)
+            self.width = rect[2] - rect[0]
+            self.height = rect[3] - rect[1]
+            self.x = rect[0]
+            self.y = rect[1]
+            win32gui.InvalidateRect(hwnd, None, True)
+            if self._on_resize_callback:
+                self._on_resize_callback(self.x, self.y, self.width, self.height)
+            return 0
+
+        def _on_entersizemove(self, hwnd, msg, wparam, lparam):
+            """Start capture timer when entering modal move/resize loop."""
+            self._in_modal_loop = True
+            _user32.SetTimer(hwnd, self._CAPTURE_TIMER_ID, self._CAPTURE_TIMER_INTERVAL, None)
+            return 0
+
+        def _on_exitsizemove(self, hwnd, msg, wparam, lparam):
+            """Stop capture timer when exiting modal move/resize loop."""
+            self._in_modal_loop = False
+            _user32.KillTimer(hwnd, self._CAPTURE_TIMER_ID)
+            return 0
+
+        def _on_timer(self, hwnd, msg, wparam, lparam):
+            """Timer tick - call capture callback."""
+            if wparam == self._CAPTURE_TIMER_ID and self._on_capture_callback:
+                try:
+                    self._on_capture_callback()
+                except Exception:
+                    pass
+            return 0
+
+        def set_callbacks(self, on_move=None, on_resize=None, on_capture=None):
+            """Set callbacks for move, resize, and capture events."""
+            self._on_move_callback = on_move
+            self._on_resize_callback = on_resize
+            self._on_capture_callback = on_capture
+
+        def set_border_color(self, color: Tuple[int, int, int]):
+            """Set the border color and trigger a repaint."""
+            self.border_color = color
+            if self.hwnd:
+                win32gui.InvalidateRect(self.hwnd, None, True)
+
+        def show(self):
+            """Show the overlay window."""
+            if self.hwnd:
+                win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNOACTIVATE)
+                win32gui.SetWindowPos(
+                    self.hwnd, win32con.HWND_TOPMOST,
+                    self.x, self.y, self.width, self.height,
+                    win32con.SWP_NOACTIVATE
+                )
+                self.visible = True
+
+        def hide(self):
+            """Hide the overlay window."""
+            if self.hwnd:
+                win32gui.ShowWindow(self.hwnd, win32con.SW_HIDE)
+                self.visible = False
+
+        def update_position(self, x: int, y: int, width: int, height: int):
+            """Update the overlay position and size."""
+            self.x = x
+            self.y = y
+            self.width = width
+            self.height = height
+            if self.hwnd and self.visible:
+                win32gui.SetWindowPos(
+                    self.hwnd, win32con.HWND_TOPMOST,
+                    x, y, width, height,
+                    win32con.SWP_NOACTIVATE
+                )
+                win32gui.InvalidateRect(self.hwnd, None, True)
+
+        def get_capture_region(self) -> Dict[str, int]:
+            """Get the capture region (inside the border)."""
+            return {
+                "left": self.x + self.border_width,
+                "top": self.y + self.border_width,
+                "width": max(1, self.width - 2 * self.border_width),
+                "height": max(1, self.height - 2 * self.border_width)
+            }
+
+        def process_messages(self):
+            """Process pending Windows messages for this window."""
+            if self.hwnd:
+                win32gui.PumpWaitingMessages()
+
+        def cleanup(self):
+            """Destroy the overlay window."""
+            if self.hwnd:
+                if self._in_modal_loop:
+                    _user32.KillTimer(self.hwnd, self._CAPTURE_TIMER_ID)
+                    self._in_modal_loop = False
+                if self.hwnd in DesktopOverlayWindow._instances:
+                    del DesktopOverlayWindow._instances[self.hwnd]
+                try:
+                    win32gui.DestroyWindow(self.hwnd)
+                except Exception:
+                    pass
+                self.hwnd = None
+                self.visible = False
+
+    # Initialize message handler lookup after class is defined
+    DesktopOverlayWindow._msg_handlers = {
+        win32con.WM_DESTROY: '_on_destroy',
+        win32con.WM_PAINT: '_on_paint',
+        win32con.WM_NCHITTEST: '_on_nchittest',
+        win32con.WM_MOVE: '_on_move',
+        win32con.WM_SIZE: '_on_size',
+        WM_ENTERSIZEMOVE: '_on_entersizemove',
+        WM_EXITSIZEMOVE: '_on_exitsizemove',
+        WM_TIMER: '_on_timer',
+    }
+
+
+@dataclass
+class ImageryItem:
+    """
+    A centralized image/animation resource that can be shared across multiple shapes.
+    Manages the master animation timing - shapes reference these items by ID.
+    """
+    id: str                                         # Unique ID (uuid)
+    name: str                                       # User-renameable name ("Item 1", "Item 2", etc.)
+    file_path: Optional[str] = None                 # Source file path
+    image_surface: Optional[pygame.Surface] = None  # Static image or first frame
+    animation_frames: List[pygame.Surface] = field(default_factory=list)
+    frame_durations: List[float] = field(default_factory=list)  # Per-frame timing
+    current_frame: int = 0                          # Master animation position
+    last_frame_time: float = 0.0                    # Master timing
+    playback_speed: float = 1.0                     # Speed multiplier (per-imagery)
+    thumbnail_surface: Optional[pygame.Surface] = None  # Cached thumbnail
+
+    # Capture rect specific fields
+    imagery_type: str = "file"                      # "file", "capture", or "videopipe"
+    capture_x: int = 100                            # Capture region X position
+    capture_y: int = 100                            # Capture region Y position
+    capture_width: int = 320                        # Capture region width
+    capture_height: int = 240                       # Capture region height
+    capture_overlay_visible: bool = False           # Whether overlay is currently visible
+    _frame_count: int = field(default=0, repr=False)  # Frame counter for thumbnail refresh
+
+    # Video pipe specific fields
+    pipe_name: str = ""                             # Name of pipe to connect to
+
+    def is_animated(self) -> bool:
+        """Check if this imagery has multiple frames."""
+        return len(self.animation_frames) > 1
+
+    def update_animation(self) -> bool:
+        """
+        Update master animation timing. Returns True if frame changed.
+        Call once per frame from ImageryManager.
+        """
+        if not self.is_animated():
+            return False
+
+        current_time = time.time()
+        if self.last_frame_time == 0:
+            self.last_frame_time = current_time
+            return False
+
+        # Get frame duration
+        if self.frame_durations and self.current_frame < len(self.frame_durations):
+            frame_duration = self.frame_durations[self.current_frame]
+        else:
+            frame_duration = 0.1  # Default 100ms
+
+        # Apply playback speed
+        effective_duration = frame_duration / max(0.1, self.playback_speed)
+
+        elapsed = current_time - self.last_frame_time
+        if elapsed >= effective_duration:
+            self.last_frame_time = current_time
+            old_frame = self.current_frame
+            self.current_frame = (self.current_frame + 1) % len(self.animation_frames)
+            return old_frame != self.current_frame
+
+        return False
+
+    def get_frame_at_offset(self, offset_percent: float) -> Tuple[Optional[pygame.Surface], int]:
+        """
+        Get the frame with a percentage offset applied.
+        offset_percent: 0-100, represents phase shift in animation cycle.
+        Returns (surface, frame_index).
+        """
+        if not self.is_animated():
+            # Single frame or no frames - return static image
+            surface = self.animation_frames[0] if self.animation_frames else self.image_surface
+            return (surface, 0)
+
+        # Calculate offset frame index
+        num_frames = len(self.animation_frames)
+        offset_frames = int((offset_percent / 100.0) * num_frames)
+        frame_idx = (self.current_frame + offset_frames) % num_frames
+        return (self.animation_frames[frame_idx], frame_idx)
+
+    def get_thumbnail(self, size: int = 32) -> pygame.Surface:
+        """Generate or return cached thumbnail."""
+        if self.thumbnail_surface is not None:
+            return self.thumbnail_surface
+
+        # Get source image
+        source = self.image_surface
+        if source is None and self.animation_frames:
+            source = self.animation_frames[0]
+
+        if source is None:
+            # Create placeholder thumbnail
+            self.thumbnail_surface = pygame.Surface((size, size), pygame.SRCALPHA)
+            self.thumbnail_surface.fill((60, 60, 70, 255))
+            pygame.draw.rect(self.thumbnail_surface, (80, 80, 90), (0, 0, size, size), 1)
+            return self.thumbnail_surface
+
+        # Scale to fit within size while maintaining aspect ratio
+        src_w, src_h = source.get_size()
+        scale = min(size / src_w, size / src_h)
+        new_w = max(1, int(src_w * scale))
+        new_h = max(1, int(src_h * scale))
+
+        # Create thumbnail with padding to center
+        self.thumbnail_surface = pygame.Surface((size, size), pygame.SRCALPHA)
+        self.thumbnail_surface.fill((0, 0, 0, 0))
+        scaled = pygame.transform.smoothscale(source, (new_w, new_h))
+        x = (size - new_w) // 2
+        y = (size - new_h) // 2
+        self.thumbnail_surface.blit(scaled, (x, y))
+
+        return self.thumbnail_surface
+
+    def invalidate_thumbnail(self):
+        """Clear cached thumbnail (call when image changes)."""
+        self.thumbnail_surface = None
+
+    def load_from_path(self, path: str) -> Optional[str]:
+        """
+        Load image or animation from path.
+        Returns error message string or None on success.
+        """
+        try:
+            self.file_path = path
+            self.animation_frames = []
+            self.frame_durations = []
+            self.current_frame = 0
+            self.last_frame_time = time.time()
+            self.invalidate_thumbnail()
+
+            # Check for video files
+            video_extensions = ('.avi', '.mov', '.mp4')
+            if path.lower().endswith(video_extensions):
+                if cv2 is None:
+                    return "OpenCV not installed - video support unavailable"
+
+                cap = cv2.VideoCapture(path)
+                if not cap.isOpened():
+                    return "Failed to open video file"
+
+                fps = cap.get(cv2.CAP_PROP_FPS) or 30
+                frame_duration = 1.0 / fps
+
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    surface = pygame.surfarray.make_surface(frame_rgb.swapaxes(0, 1))
+                    surface = surface.convert_alpha()
+                    self.animation_frames.append(surface)
+                    self.frame_durations.append(frame_duration)
+
+                cap.release()
+
+                if not self.animation_frames:
+                    return "No frames extracted from video"
+
+                self.image_surface = self.animation_frames[0]
+                return None
+
+            # Check for animated GIF
+            if path.lower().endswith('.gif'):
+                pil_image = Image.open(path)
+                try:
+                    n_frames = getattr(pil_image, 'n_frames', 1)
+                    if n_frames > 1:
+                        canvas = Image.new('RGBA', pil_image.size, (0, 0, 0, 0))
+
+                        for frame_idx in range(n_frames):
+                            pil_image.seek(frame_idx)
+                            duration = pil_image.info.get('duration', 100) / 1000.0
+                            if duration <= 0:
+                                duration = 0.1
+                            self.frame_durations.append(duration)
+
+                            frame_rgba = pil_image.convert('RGBA')
+                            canvas.paste(frame_rgba, (0, 0), frame_rgba)
+
+                            frame_copy = canvas.copy()
+                            mode = frame_copy.mode
+                            size = frame_copy.size
+                            data = frame_copy.tobytes()
+                            pygame_surface = pygame.image.fromstring(data, size, mode)
+                            self.animation_frames.append(pygame_surface)
+
+                            disposal = pil_image.info.get('disposal', 0)
+                            if disposal == 2:
+                                canvas = Image.new('RGBA', pil_image.size, (0, 0, 0, 0))
+
+                        self.image_surface = self.animation_frames[0]
+                        return None
+                except EOFError:
+                    pass
+
+            # Static image
+            self.image_surface = pygame.image.load(path).convert_alpha()
+            return None
+        except Exception as e:
+            print(f"Failed to load image: {e}")
+            self.image_surface = None
+            return str(e)
+
+    # -------------------------------------------------------------------------
+    # Capture-specific methods
+    # -------------------------------------------------------------------------
+
+    def __post_init__(self):
+        """Initialize non-field attributes after dataclass init."""
+        # These are runtime-only, not serialized
+        self._overlay_window = None
+        self._mss_capture = None
+        # Modal frame callback for rendering during overlay move/resize
+        self._modal_frame_callback: Optional[Callable] = None
+        # Video pipe runtime state
+        self._spout_receiver = None
+        self._pipe_connected = False
+        self._pipe_width = 0
+        self._pipe_height = 0
+        self._pipe_buffer = None
+
+    def is_capture(self) -> bool:
+        """Check if this imagery is a capture rect."""
+        return self.imagery_type == "capture"
+
+    def is_videopipe(self) -> bool:
+        """Check if this imagery is a video pipe receiver."""
+        return self.imagery_type == "videopipe"
+
+    def start_capture(self):
+        """Initialize mss capture."""
+        if not DESKTOP_CAPTURE_AVAILABLE:
+            return
+        if self._mss_capture is None:
+            self._mss_capture = mss.mss()
+
+    def stop_capture(self):
+        """Stop and cleanup capture."""
+        if self._mss_capture is not None:
+            try:
+                self._mss_capture.close()
+            except Exception:
+                pass
+            self._mss_capture = None
+
+    def update_capture(self):
+        """Capture current frame and update image_surface."""
+        if not self.is_capture() or not DESKTOP_CAPTURE_AVAILABLE:
+            return
+
+        if self._mss_capture is None:
+            self.start_capture()
+            if self._mss_capture is None:
+                return
+
+        # Get overlay region or use stored coords
+        if self._overlay_window is not None and self._overlay_window.visible:
+            region = self._overlay_window.get_capture_region()
+        else:
+            border = 4
+            region = {
+                "left": self.capture_x + border,
+                "top": self.capture_y + border,
+                "width": max(1, self.capture_width - 2 * border),
+                "height": max(1, self.capture_height - 2 * border)
+            }
+
+        try:
+            # Capture
+            screenshot = self._mss_capture.grab(region)
+
+            # Convert to pygame surface (BGRA -> RGB)
+            img = np.array(screenshot)
+            # mss returns BGRA, we need RGB
+            img_rgb = img[:, :, [2, 1, 0]]
+
+            # Create pygame surface
+            self.image_surface = pygame.surfarray.make_surface(
+                img_rgb.swapaxes(0, 1)
+            ).convert()
+
+            # Increment frame counter and invalidate thumbnail periodically
+            self._frame_count += 1
+            if self._frame_count % 10 == 0:
+                self.invalidate_thumbnail()
+        except Exception as e:
+            print(f"Capture error: {e}")
+
+    def _modal_capture_and_render(self):
+        """Capture frame and trigger display update during modal move/resize."""
+        self.update_capture()
+        if self._modal_frame_callback:
+            self._modal_frame_callback()
+
+    def set_modal_frame_callback(self, callback: Optional[Callable]):
+        """Set callback for modal frame updates during overlay move/resize."""
+        self._modal_frame_callback = callback
+
+    def show_overlay(self):
+        """Show the desktop overlay window."""
+        if not DESKTOP_CAPTURE_AVAILABLE:
+            return
+
+        if self._overlay_window is None:
+            self._overlay_window = DesktopOverlayWindow(
+                self.capture_x, self.capture_y,
+                self.capture_width, self.capture_height,
+                border_color=(0, 200, 100)
+            )
+
+            def on_move(x, y):
+                self.capture_x = x
+                self.capture_y = y
+
+            def on_resize(x, y, w, h):
+                self.capture_x = x
+                self.capture_y = y
+                self.capture_width = w
+                self.capture_height = h
+
+            self._overlay_window.set_callbacks(
+                on_move=on_move,
+                on_resize=on_resize,
+                on_capture=self._modal_capture_and_render
+            )
+
+        self._overlay_window.show()
+        self.capture_overlay_visible = True
+
+    def hide_overlay(self):
+        """Hide the desktop overlay window."""
+        if self._overlay_window is not None:
+            self._overlay_window.hide()
+        self.capture_overlay_visible = False
+
+    def toggle_overlay(self):
+        """Toggle overlay visibility."""
+        if self.capture_overlay_visible:
+            self.hide_overlay()
+        else:
+            self.show_overlay()
+
+    def cleanup_capture(self):
+        """Cleanup capture resources."""
+        self.stop_capture()
+        if self._overlay_window is not None:
+            self._overlay_window.cleanup()
+            self._overlay_window = None
+
+    # -------------------------------------------------------------------------
+    # Video pipe-specific methods
+    # -------------------------------------------------------------------------
+
+    def start_videopipe(self, pipe_name: str):
+        """Initialize Spout receiver for the given pipe name."""
+        if not VIDEOPIPE_AVAILABLE:
+            return
+
+        self.pipe_name = pipe_name
+        self._pipe_connected = False
+
+        try:
+            self._spout_receiver = SpoutGL.SpoutReceiver()
+            self._spout_receiver.setReceiverName(pipe_name)
+            # Enable CPU sharing mode for receiveImage to work
+            self._spout_receiver.setCPUshare(True)
+            self._pipe_width = 0
+            self._pipe_height = 0
+            self._pipe_buffer = None
+        except Exception as e:
+            print(f"Failed to create Spout receiver: {e}")
+            import traceback
+            traceback.print_exc()
+            self._spout_receiver = None
+
+    def update_videopipe(self):
+        """Receive frame from video pipe and update image_surface."""
+        if not self.is_videopipe() or not VIDEOPIPE_AVAILABLE:
+            return
+
+        if self._spout_receiver is None:
+            self.start_videopipe(self.pipe_name)
+            if self._spout_receiver is None:
+                return
+
+        try:
+            # Get sender dimensions
+            width = self._spout_receiver.getSenderWidth()
+            height = self._spout_receiver.getSenderHeight()
+            is_connected = self._spout_receiver.isConnected()
+            sender_name = self._spout_receiver.getSenderName()
+
+            is_updated = self._spout_receiver.isUpdated()
+
+            # If dimensions changed or buffer not allocated, reallocate
+            if width > 0 and height > 0:
+                if (self._pipe_width != width or self._pipe_height != height or
+                    self._pipe_buffer is None):
+                    self._pipe_width = width
+                    self._pipe_height = height
+                    self._pipe_buffer = np.zeros((height, width, 4), dtype=np.uint8, order='C')
+
+                # Save current FBO binding - SpoutGL requires default FBO
+                current_fbo = glGetIntegerv(GL_FRAMEBUFFER_BINDING)
+                glBindFramebuffer(GL_FRAMEBUFFER, 0)
+
+                # Receive image into buffer
+                result = self._spout_receiver.receiveImage(
+                    self._pipe_buffer, GL_RGBA, False, 0
+                )
+
+                # Restore FBO binding
+                glBindFramebuffer(GL_FRAMEBUFFER, current_fbo)
+
+                buffer_has_data = np.any(self._pipe_buffer)
+
+                if result and buffer_has_data:
+                    self._pipe_connected = True
+
+                    # Convert RGBA to RGB for pygame
+                    img_rgb = self._pipe_buffer[:, :, :3]
+
+                    # Create pygame surface
+                    self.image_surface = pygame.surfarray.make_surface(
+                        img_rgb.swapaxes(0, 1)
+                    ).convert()
+
+                    # Periodically invalidate thumbnail
+                    if self._frame_count % 10 == 0:
+                        self.invalidate_thumbnail()
+                else:
+                    # Check if still connected
+                    self._pipe_connected = self._spout_receiver.isConnected()
+            else:
+                # No valid dimensions yet - try a dummy receive to trigger connection
+                current_fbo = glGetIntegerv(GL_FRAMEBUFFER_BINDING)
+                glBindFramebuffer(GL_FRAMEBUFFER, 0)
+
+                dummy = np.zeros((16, 16, 4), dtype=np.uint8, order='C')
+                self._spout_receiver.receiveImage(dummy, GL_RGBA, False, 0)
+
+                glBindFramebuffer(GL_FRAMEBUFFER, current_fbo)
+                self._pipe_connected = False
+
+            self._frame_count += 1
+        except Exception as e:
+            print(f"Video pipe receive error: {e}")
+            import traceback
+            traceback.print_exc()
+            self._pipe_connected = False
+
+    def cleanup_videopipe(self):
+        """Release Spout receiver resources."""
+        if self._spout_receiver is not None:
+            try:
+                self._spout_receiver.releaseReceiver()
+            except Exception:
+                pass
+            self._spout_receiver = None
+        self._pipe_connected = False
+        self._pipe_width = 0
+        self._pipe_height = 0
+        self._pipe_buffer = None
+
+    def cleanup(self):
+        """Cleanup all resources based on imagery type."""
+        if self.is_capture():
+            self.cleanup_capture()
+        elif self.is_videopipe():
+            self.cleanup_videopipe()
+
+    def to_dict(self) -> dict:
+        """Serialize to dictionary (excludes surfaces)."""
+        data = {
+            'id': self.id,
+            'name': self.name,
+            'file_path': self.file_path,
+            'playback_speed': self.playback_speed,
+            'imagery_type': self.imagery_type,
+        }
+        if self.imagery_type == "capture":
+            data['capture_x'] = self.capture_x
+            data['capture_y'] = self.capture_y
+            data['capture_width'] = self.capture_width
+            data['capture_height'] = self.capture_height
+            data['capture_overlay_visible'] = self.capture_overlay_visible
+        elif self.imagery_type == "videopipe":
+            data['pipe_name'] = self.pipe_name
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'ImageryItem':
+        """Deserialize from dictionary."""
+        item = cls(
+            id=data.get('id', str(uuid.uuid4())),
+            name=data.get('name', 'Unnamed'),
+            file_path=data.get('file_path'),
+            playback_speed=data.get('playback_speed', 1.0),
+            imagery_type=data.get('imagery_type', 'file'),
+        )
+
+        # Handle capture items
+        if item.imagery_type == "capture":
+            item.capture_x = data.get('capture_x', 100)
+            item.capture_y = data.get('capture_y', 100)
+            item.capture_width = data.get('capture_width', 320)
+            item.capture_height = data.get('capture_height', 240)
+            item.start_capture()
+            if data.get('capture_overlay_visible', False):
+                item.show_overlay()
+        # Handle videopipe items
+        elif item.imagery_type == "videopipe":
+            item.pipe_name = data.get('pipe_name', '')
+            if item.pipe_name:
+                item.start_videopipe(item.pipe_name)
+        # Load image if path exists
+        elif item.file_path and os.path.exists(item.file_path):
+            item.load_from_path(item.file_path)
+        return item
+
+
+class ImageryManager:
+    """
+    Manages the collection of ImageryItem instances.
+    Provides centralized animation updates and lookup by ID.
+    """
+    def __init__(self):
+        self.items: Dict[str, ImageryItem] = {}  # id -> ImageryItem
+        self.item_counter: int = 0  # For auto-naming
+        self._modal_frame_callback: Optional[Callable] = None  # Callback for modal frame updates
+
+    def create_item(self, file_path: Optional[str] = None) -> ImageryItem:
+        """Create a new ImageryItem with optional file path."""
+        self.item_counter += 1
+        item_id = str(uuid.uuid4())
+        name = f"Item {self.item_counter}"
+
+        item = ImageryItem(id=item_id, name=name)
+        if file_path:
+            item.load_from_path(file_path)
+
+        self.items[item_id] = item
+        return item
+
+    def create_capture_item(self) -> Optional[ImageryItem]:
+        """Create a new capture rect imagery item."""
+        if not DESKTOP_CAPTURE_AVAILABLE:
+            return None
+
+        self.item_counter += 1
+        item_id = str(uuid.uuid4())
+        name = f"Capture {self.item_counter}"
+
+        item = ImageryItem(
+            id=item_id,
+            name=name,
+            imagery_type="capture",
+            capture_x=100,
+            capture_y=100,
+            capture_width=320,
+            capture_height=240
+        )
+        item.start_capture()
+        # Set modal frame callback for rendering during overlay move/resize
+        if self._modal_frame_callback:
+            item.set_modal_frame_callback(self._modal_frame_callback)
+        self.items[item_id] = item
+        return item
+
+    def create_videopipe_item(self, pipe_name: str) -> Optional[ImageryItem]:
+        """Create a new video pipe imagery item."""
+        if not VIDEOPIPE_AVAILABLE:
+            return None
+
+        self.item_counter += 1
+        item_id = str(uuid.uuid4())
+
+        item = ImageryItem(
+            id=item_id,
+            name=pipe_name,  # Default name is pipe name
+            imagery_type="videopipe",
+            pipe_name=pipe_name
+        )
+        item.start_videopipe(pipe_name)
+        self.items[item_id] = item
+        return item
+
+    def set_modal_frame_callback(self, callback: Optional[Callable]):
+        """Set callback for modal frame updates during overlay move/resize.
+
+        This callback is invoked during Windows modal move/resize loops
+        to keep the display updating while the main event loop is blocked.
+        """
+        self._modal_frame_callback = callback
+        # Apply to existing capture items
+        for item in self.items.values():
+            if item.is_capture():
+                item.set_modal_frame_callback(callback)
+
+    def get_available_pipes(self) -> List[str]:
+        """Get list of available video pipe sources."""
+        if not VIDEOPIPE_AVAILABLE:
+            return []
+        try:
+            temp_receiver = SpoutGL.SpoutReceiver()
+            sources = temp_receiver.getSenderList()
+            temp_receiver.releaseReceiver()
+            return sources if sources else []
+        except Exception as e:
+            print(f"Error getting pipe list: {e}")
+            return []
+
+    def get_item(self, item_id: Optional[str]) -> Optional[ImageryItem]:
+        """Get item by ID, returns None if not found."""
+        if item_id is None:
+            return None
+        return self.items.get(item_id)
+
+    def delete_item(self, item_id: str, clear_refs_callback: Optional[callable] = None) -> bool:
+        """
+        Delete an item by ID.
+        If clear_refs_callback is provided, it's called to clear shape references.
+        Returns True if item was deleted.
+        """
+        if item_id not in self.items:
+            return False
+
+        item = self.items[item_id]
+        item.cleanup()
+
+        if clear_refs_callback:
+            clear_refs_callback(item_id)
+
+        del self.items[item_id]
+        return True
+
+    def rename_item(self, item_id: str, new_name: str) -> bool:
+        """Rename an item. Returns True if successful."""
+        item = self.items.get(item_id)
+        if item:
+            item.name = new_name
+            return True
+        return False
+
+    def update_animations(self):
+        """Update all animated, capture, and videopipe items. Call once per frame."""
+        for item in self.items.values():
+            if item.is_capture():
+                item.update_capture()
+            elif item.is_videopipe():
+                item.update_videopipe()
+            else:
+                item.update_animation()
+
+    def get_items_list(self) -> List[ImageryItem]:
+        """Get list of all items in creation order."""
+        return list(self.items.values())
+
+    def to_dict(self) -> dict:
+        """Serialize manager state to dictionary."""
+        return {
+            'items': [item.to_dict() for item in self.items.values()],
+            'counter': self.item_counter,
+        }
+
+    def from_dict(self, data: dict):
+        """Deserialize manager state from dictionary."""
+        self.items.clear()
+        self.item_counter = data.get('counter', 0)
+        for item_data in data.get('items', []):
+            item = ImageryItem.from_dict(item_data)
+            # Set modal frame callback for capture items
+            if item.is_capture() and self._modal_frame_callback:
+                item.set_modal_frame_callback(self._modal_frame_callback)
+            self.items[item.id] = item
+
+    def clear(self):
+        """Clear all items."""
+        for item in self.items.values():
+            item.cleanup()
+        self.items.clear()
+        self.item_counter = 0
+
+    def process_overlay_messages(self):
+        """Process Windows messages for all visible capture overlays."""
+        if not DESKTOP_CAPTURE_AVAILABLE:
+            return
+        for item in self.items.values():
+            if item.is_capture() and item._overlay_window is not None:
+                item._overlay_window.process_messages()
+
+
 class Button:
     def __init__(self, x, y, width, height, text, callback=None, tooltip=None):
         self.rect = pygame.Rect(x, y, width, height)
@@ -1502,8 +2633,11 @@ class Button:
         self.focused = False  # For keyboard navigation
         self.hover_start_time = 0
         self.disabled = False  # Disabled state
+        self.visible = True  # Visibility state
 
     def draw(self, screen, font):
+        if not self.visible:
+            return
         if self.disabled:
             # Disabled state: dimmed colors
             color = (40, 40, 45)  # Very dark gray
@@ -1524,37 +2658,16 @@ class Button:
 
     def draw_tooltip(self, screen, font, scale=1.0):
         """Draw tooltip if hovered for sufficient time"""
+        if not self.visible:
+            return
         if self.tooltip and self.hovered:
             elapsed = time.time() - self.hover_start_time
-            if elapsed >= 0.5:  # Show tooltip after 500ms
-                # Create tooltip surface
-                padding = int(6 * scale)
-                margin = int(5 * scale)
-                cursor_offset = int(16 * scale)  # Offset from cursor
-                text_surf = font.render(self.tooltip, True, (255, 255, 255))
-                tooltip_w = text_surf.get_width() + padding * 2
-                tooltip_h = text_surf.get_height() + padding * 2
-
-                # Position tooltip below and to the right of cursor
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                tooltip_x = mouse_x + cursor_offset
-                tooltip_y = mouse_y + cursor_offset
-
-                # Keep tooltip on screen
-                screen_w, screen_h = screen.get_size()
-                if tooltip_x + tooltip_w > screen_w - margin:
-                    tooltip_x = mouse_x - tooltip_w - margin
-                if tooltip_y + tooltip_h > screen_h - margin:
-                    tooltip_y = mouse_y - tooltip_h - margin
-
-                # Draw tooltip background
-                tooltip_rect = pygame.Rect(tooltip_x, tooltip_y, tooltip_w, tooltip_h)
-                border_radius = int(4 * scale)
-                pygame.draw.rect(screen, (50, 50, 55), tooltip_rect, border_radius=border_radius)
-                pygame.draw.rect(screen, (100, 100, 110), tooltip_rect, 1, border_radius=border_radius)
-                screen.blit(text_surf, (tooltip_x + padding, tooltip_y + padding))
+            if elapsed >= TOOLTIP_DELAY:
+                draw_tooltip_at_cursor(screen, font, self.tooltip, scale)
 
     def handle_event(self, event):
+        if not self.visible:
+            return False
         if event.type == pygame.MOUSEMOTION:
             was_hovered = self.hovered
             self.hovered = self.rect.collidepoint(event.pos)
@@ -1663,33 +2776,8 @@ class Slider:
         """Draw tooltip if hovered for sufficient time"""
         if self.tooltip and self.hovered:
             elapsed = time.time() - self.hover_start_time
-            if elapsed >= 0.5:  # Show tooltip after 500ms
-                # Create tooltip surface
-                padding = int(6 * scale)
-                margin = int(5 * scale)
-                cursor_offset = int(16 * scale)  # Offset from cursor
-                text_surf = font.render(self.tooltip, True, (255, 255, 255))
-                tooltip_w = text_surf.get_width() + padding * 2
-                tooltip_h = text_surf.get_height() + padding * 2
-
-                # Position tooltip below and to the right of cursor
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                tooltip_x = mouse_x + cursor_offset
-                tooltip_y = mouse_y + cursor_offset
-
-                # Keep tooltip on screen
-                screen_w, screen_h = screen.get_size()
-                if tooltip_x + tooltip_w > screen_w - margin:
-                    tooltip_x = mouse_x - tooltip_w - margin
-                if tooltip_y + tooltip_h > screen_h - margin:
-                    tooltip_y = mouse_y - tooltip_h - margin
-
-                # Draw tooltip background
-                tooltip_rect = pygame.Rect(tooltip_x, tooltip_y, tooltip_w, tooltip_h)
-                border_radius = int(4 * scale)
-                pygame.draw.rect(screen, (50, 50, 55), tooltip_rect, border_radius=border_radius)
-                pygame.draw.rect(screen, (100, 100, 110), tooltip_rect, 1, border_radius=border_radius)
-                screen.blit(text_surf, (tooltip_x + padding, tooltip_y + padding))
+            if elapsed >= TOOLTIP_DELAY:
+                draw_tooltip_at_cursor(screen, font, self.tooltip, scale)
 
 
 class TextInput:
@@ -1910,33 +2998,8 @@ class NumericEntry:
         """Draw tooltip if hovered for sufficient time"""
         if self.tooltip and self.hovered:
             elapsed = time.time() - self.hover_start_time
-            if elapsed >= 0.5:  # Show tooltip after 500ms
-                # Create tooltip surface
-                padding = int(6 * scale)
-                margin = int(5 * scale)
-                cursor_offset = int(16 * scale)  # Offset from cursor
-                text_surf = font.render(self.tooltip, True, (255, 255, 255))
-                tooltip_w = text_surf.get_width() + padding * 2
-                tooltip_h = text_surf.get_height() + padding * 2
-
-                # Position tooltip below and to the right of cursor
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                tooltip_x = mouse_x + cursor_offset
-                tooltip_y = mouse_y + cursor_offset
-
-                # Keep tooltip on screen
-                screen_w, screen_h = screen.get_size()
-                if tooltip_x + tooltip_w > screen_w - margin:
-                    tooltip_x = mouse_x - tooltip_w - margin
-                if tooltip_y + tooltip_h > screen_h - margin:
-                    tooltip_y = mouse_y - tooltip_h - margin
-
-                # Draw tooltip background
-                tooltip_rect = pygame.Rect(tooltip_x, tooltip_y, tooltip_w, tooltip_h)
-                border_radius = int(4 * scale)
-                pygame.draw.rect(screen, (50, 50, 55), tooltip_rect, border_radius=border_radius)
-                pygame.draw.rect(screen, (100, 100, 110), tooltip_rect, 1, border_radius=border_radius)
-                screen.blit(text_surf, (tooltip_x + padding, tooltip_y + padding))
+            if elapsed >= TOOLTIP_DELAY:
+                draw_tooltip_at_cursor(screen, font, self.tooltip, scale)
 
     def update(self, dt):
         """Update cursor blink"""
@@ -1948,7 +3011,7 @@ class NumericEntry:
 
 
 class UndoManager:
-    """Manages undo/redo state for the application (supports hierarchy)"""
+    """Manages undo/redo state for the application (supports hierarchy and imagery)"""
     def __init__(self, max_history=50):
         self.undo_stack = []
         self.redo_stack = []
@@ -1968,10 +3031,12 @@ class UndoManager:
                 result.append(Shape.from_dict(item_data))
         return result
 
-    def save_state(self, scene_root: List[SceneItem]):
-        """Save current state to undo stack"""
-        # Serialize scene_root to dicts (handles both shapes and groups)
-        state = self._serialize_items(scene_root)
+    def save_state(self, scene_root: List[SceneItem], imagery_manager: Optional['ImageryManager'] = None):
+        """Save current state to undo stack (includes scene and imagery)"""
+        state = {
+            'scene': self._serialize_items(scene_root),
+            'imagery': imagery_manager.to_dict() if imagery_manager else None
+        }
         self.undo_stack.append(state)
         # Clear redo stack when new action is performed
         self.redo_stack = []
@@ -1979,27 +3044,33 @@ class UndoManager:
         if len(self.undo_stack) > self.max_history:
             self.undo_stack.pop(0)
 
-    def undo(self, current_scene_root: List[SceneItem]) -> Optional[List[SceneItem]]:
-        """Undo last action, returns new scene_root or None if nothing to undo"""
+    def _capture_state(self, scene_root: List[SceneItem],
+                       imagery_manager: Optional['ImageryManager'] = None) -> dict:
+        """Capture current scene and imagery state as a serializable dictionary."""
+        return {
+            'scene': self._serialize_items(scene_root),
+            'imagery': imagery_manager.to_dict() if imagery_manager else None
+        }
+
+    def _restore_state(self, state: dict) -> Tuple[List[SceneItem], Optional[dict]]:
+        """Restore a previously captured state."""
+        return (self._deserialize_items(state['scene']), state.get('imagery'))
+
+    def undo(self, current_scene_root: List[SceneItem],
+             imagery_manager: Optional['ImageryManager'] = None) -> Optional[Tuple[List[SceneItem], Optional[dict]]]:
+        """Undo last action, returns (scene_root, imagery_dict) or None if nothing to undo"""
         if not self.undo_stack:
             return None
-        # Save current state to redo stack
-        current_state = self._serialize_items(current_scene_root)
-        self.redo_stack.append(current_state)
-        # Restore previous state
-        prev_state = self.undo_stack.pop()
-        return self._deserialize_items(prev_state)
+        self.redo_stack.append(self._capture_state(current_scene_root, imagery_manager))
+        return self._restore_state(self.undo_stack.pop())
 
-    def redo(self, current_scene_root: List[SceneItem]) -> Optional[List[SceneItem]]:
-        """Redo last undone action, returns new scene_root or None if nothing to redo"""
+    def redo(self, current_scene_root: List[SceneItem],
+             imagery_manager: Optional['ImageryManager'] = None) -> Optional[Tuple[List[SceneItem], Optional[dict]]]:
+        """Redo last undone action, returns (scene_root, imagery_dict) or None if nothing to redo"""
         if not self.redo_stack:
             return None
-        # Save current state to undo stack
-        current_state = self._serialize_items(current_scene_root)
-        self.undo_stack.append(current_state)
-        # Restore redo state
-        next_state = self.redo_stack.pop()
-        return self._deserialize_items(next_state)
+        self.undo_stack.append(self._capture_state(current_scene_root, imagery_manager))
+        return self._restore_state(self.redo_stack.pop())
 
     def can_undo(self):
         return len(self.undo_stack) > 0
@@ -2089,10 +3160,19 @@ class ContextMenu:
     def show(self, x: int, y: int, items: List[Tuple[str, callable]]):
         """Show menu at position with given items [(label, callback), ...]"""
         self.visible = True
-        self.x = x
-        self.y = y
         self.items = items
         self.hovered_index = -1
+
+        # Calculate menu dimensions
+        menu_height = len(items) * self.item_height + 8
+        menu_width = self.width
+
+        # Clamp to screen bounds
+        self.x = min(x, WIDTH - menu_width)
+        self.y = min(y, HEIGHT - menu_height)
+        # Also prevent negative positions
+        self.x = max(0, self.x)
+        self.y = max(0, self.y)
 
     def hide(self):
         """Hide the context menu"""
@@ -2168,10 +3248,11 @@ class ContextMenu:
             y += self.item_height
 
 
-class HierarchyPanel:
+class ScenePanel:
     """
     Collapsible sidebar panel showing scene hierarchy tree.
     Supports expand/collapse groups, selection, drag-drop reordering.
+    Includes Save/Load/New Scene buttons.
     """
     # Colors
     BG_COLOR = (35, 35, 40)
@@ -2186,10 +3267,12 @@ class HierarchyPanel:
     RESIZE_HANDLE_COLOR = (80, 80, 90)
     DROP_LINE_COLOR = (100, 200, 255)
     DROP_INTO_COLOR = (80, 150, 220, 100)
+    BUTTON_COLOR = (55, 55, 65)
+    BUTTON_HOVER_COLOR = (70, 70, 85)
 
     MIN_WIDTH = 150
     MAX_WIDTH = 400
-    HEADER_HEIGHT = 70  # Includes search bar
+    HEADER_HEIGHT = 104  # Title + buttons row + search bar
     ROW_HEIGHT = 26
     INDENT_SIZE = 18
     ICON_SIZE = 14
@@ -2247,33 +3330,19 @@ class HierarchyPanel:
 
         # Search field tooltip state
         self.search_hovered = False
+
+        # Scene button hover state
+        self.hover_save = False
+        self.hover_load = False
+        self.hover_new = False
         self.search_hover_start = 0.0
 
     def update_animation(self):
-        """Update panel animation state"""
-        if not self.animating:
-            return
-
-        import time
-        elapsed = time.time() - self.animation_start
-        t = min(1.0, elapsed / self.animation_duration)
-
-        # Ease-out: 1 - (1 - t)^2
-        eased = 1 - (1 - t) ** 2
-
-        if self.collapsed:
-            # Collapsing: 1.0 -> 0.0
-            self.animation_progress = 1.0 - eased
-        else:
-            # Expanding: 0.0 -> 1.0
-            self.animation_progress = eased
-
-        if t >= 1.0:
-            self.animating = False
-            self.animation_progress = 0.0 if self.collapsed else 1.0
+        """Update panel animation state."""
+        update_panel_animation(self)
 
     def get_rect(self) -> pygame.Rect:
-        """Get panel rectangle based on animation progress"""
+        """Get panel rectangle based on animation progress."""
         scale = self.app.ui_scale
         handle_w = int(self.HANDLE_WIDTH * scale)
         expanded_w = int(self.width * scale)
@@ -2368,15 +3437,31 @@ class HierarchyPanel:
         """Get search input rectangle (accounting for handle on right edge)"""
         scale = self.app.ui_scale
         margin = int(8 * scale)
-        title_height = int(28 * scale)
+        # Search is below title and buttons row
+        search_y = int(70 * scale)  # After title (28) + button row (34) + gap (8)
         input_height = int(26 * scale)
         # Content width is panel width minus handle
         content_w = int(self.width * scale) - int(self.HANDLE_WIDTH * scale)
-        return pygame.Rect(margin, title_height, content_w - margin * 2, input_height)
+        return pygame.Rect(margin, search_y, content_w - margin * 2, input_height)
+
+    def _get_scene_buttons_rect(self) -> Tuple[pygame.Rect, pygame.Rect, pygame.Rect]:
+        """Get rectangles for Save, Load, New buttons."""
+        scale = self.app.ui_scale
+        margin = int(8 * scale)
+        btn_y = int(34 * scale)  # Below title
+        btn_h = int(26 * scale)
+        gap = int(4 * scale)
+        # Content width is panel width minus handle
+        content_w = int(self.width * scale) - int(self.HANDLE_WIDTH * scale)
+        btn_w = (content_w - margin * 2 - gap * 2) // 3
+
+        btn_save = pygame.Rect(margin, btn_y, btn_w, btn_h)
+        btn_load = pygame.Rect(margin + btn_w + gap, btn_y, btn_w, btn_h)
+        btn_new = pygame.Rect(margin + (btn_w + gap) * 2, btn_y, btn_w, btn_h)
+        return btn_save, btn_load, btn_new
 
     def handle_event(self, event) -> bool:
-        """Handle event, returns True if event was consumed"""
-        import time
+        """Handle event, returns True if event was consumed."""
         handle_rect = self._get_handle_rect()
         panel_rect = self.get_rect()
 
@@ -2405,6 +3490,18 @@ class HierarchyPanel:
                     self.collapsed = True
                     self.animating = True
                     self.animation_start = time.time()
+                    return True
+
+                # Check scene button clicks
+                btn_save, btn_load, btn_new = self._get_scene_buttons_rect()
+                if btn_save.collidepoint(event.pos):
+                    self.app.save_scene()
+                    return True
+                if btn_load.collidepoint(event.pos):
+                    self.app.load_scene()
+                    return True
+                if btn_new.collidepoint(event.pos):
+                    self.app.new_scene()
                     return True
 
             if handle_rect.collidepoint(event.pos):
@@ -2450,8 +3547,17 @@ class HierarchyPanel:
                 self.search_hovered = search_rect.collidepoint(event.pos)
                 if self.search_hovered and not was_search_hovered:
                     self.search_hover_start = time.time()
+
+                # Track button hover
+                btn_save, btn_load, btn_new = self._get_scene_buttons_rect()
+                self.hover_save = btn_save.collidepoint(event.pos)
+                self.hover_load = btn_load.collidepoint(event.pos)
+                self.hover_new = btn_new.collidepoint(event.pos)
             else:
                 self.search_hovered = False
+                self.hover_save = False
+                self.hover_load = False
+                self.hover_new = False
 
         # If fully collapsed, only handle within handle area
         if self.collapsed and self.animation_progress < 0.05:
@@ -2763,6 +3869,15 @@ class HierarchyPanel:
         self.rename_text = ""
         self.rename_cursor = 0
 
+    def _draw_panel_button(self, surface, rect: pygame.Rect, label: str, hovered: bool):
+        """Draw a small panel button with hover state."""
+        bg_color = self.BUTTON_HOVER_COLOR if hovered else self.BUTTON_COLOR
+        pygame.draw.rect(surface, bg_color, rect, border_radius=3)
+        pygame.draw.rect(surface, (70, 70, 80), rect, 1, border_radius=3)
+        text_surf = self.app.font_small.render(label, True, self.TEXT_COLOR)
+        surface.blit(text_surf, (rect.x + (rect.width - text_surf.get_width()) // 2,
+                                 rect.y + (rect.height - text_surf.get_height()) // 2))
+
     def _draw_layers_icon(self, surface, cx: int, cy: int, scale: float):
         """Draw a layers icon (3 stacked horizontal lines)"""
         line_width = int(10 * scale)
@@ -2814,9 +3929,9 @@ class HierarchyPanel:
             ]
         pygame.draw.lines(surface, (180, 180, 180), False, points, 2)
 
-        # Draw vertical "Hierarchy" text when collapsed
+        # Draw vertical "Scene" text when collapsed
         if self.animation_progress < 0.05:
-            text_surf = self.app.font_small.render("Hierarchy", True, (180, 180, 180))
+            text_surf = self.app.font_small.render("Scene", True, (180, 180, 180))
             rotated = pygame.transform.rotate(text_surf, -90)  # 90 degrees clockwise
             text_x = cx - rotated.get_width() // 2
             text_y = cy + chevron_size + int(10 * scale)
@@ -2869,8 +3984,16 @@ class HierarchyPanel:
         pygame.draw.lines(surface, self.TEXT_COLOR, False, points, 2)
 
         # Title shifted right to accommodate chevron
-        title_surf = self.app.font.render("Hierarchy", True, self.TEXT_COLOR)
+        title_surf = self.app.font.render("Scene", True, self.TEXT_COLOR)
         surface.blit(title_surf, (chevron_x + chevron_size, int(4 * scale)))
+
+        # Scene buttons (Save, Load, New)
+        btn_save, btn_load, btn_new = self._get_scene_buttons_rect()
+
+        # Scene buttons
+        self._draw_panel_button(surface, btn_save, "Save", self.hover_save)
+        self._draw_panel_button(surface, btn_load, "Load", self.hover_load)
+        self._draw_panel_button(surface, btn_new, "New", self.hover_new)
 
         # Search input
         search_rect = self._get_search_rect()
@@ -3020,85 +4143,1024 @@ class HierarchyPanel:
         else:
             # Draw normal name
             name = item.name or "(unnamed)"
-            text_color = self.TEXT_COLOR if is_selected else self.TEXT_COLOR
-            name_surf = self.app.font_small.render(name, True, text_color)
+            name_surf = self.app.font_small.render(name, True, self.TEXT_COLOR)
 
             # Truncate name if too long
             if name_surf.get_width() > max_name_width:
                 # Truncate with ellipsis
                 while name_surf.get_width() > max_name_width and len(name) > 1:
                     name = name[:-1]
-                    name_surf = self.app.font_small.render(name + "...", True, text_color)
+                    name_surf = self.app.font_small.render(name + "...", True, self.TEXT_COLOR)
 
             surface.blit(name_surf, (x, text_y))
 
     def draw_tooltip(self, surface, font, scale=1.0):
-        """Draw tooltip for chevron if hovered for sufficient time"""
+        """Draw tooltip for chevron or search field if hovered for sufficient time"""
         if self.chevron_hovered:
             elapsed = time.time() - self.chevron_hover_start
-            if elapsed >= 0.5:  # Show tooltip after 500ms
-                # Determine tooltip text based on collapsed state
-                tooltip_text = "Expand hierarchy" if self.collapsed else "Collapse hierarchy"
+            if elapsed >= TOOLTIP_DELAY:
+                tooltip_text = "Expand scene panel" if self.collapsed else "Collapse scene panel"
+                draw_tooltip_at_cursor(surface, font, tooltip_text, scale)
 
-                # Create tooltip surface
-                padding = int(6 * scale)
-                margin = int(5 * scale)
-                cursor_offset = int(16 * scale)  # Offset from cursor
-                text_surf = font.render(tooltip_text, True, (255, 255, 255))
-                tooltip_w = text_surf.get_width() + padding * 2
-                tooltip_h = text_surf.get_height() + padding * 2
-
-                # Position tooltip below and to the right of cursor
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                tooltip_x = mouse_x + cursor_offset
-                tooltip_y = mouse_y + cursor_offset
-
-                # Keep tooltip on screen
-                screen_w, screen_h = surface.get_size()
-                if tooltip_x + tooltip_w > screen_w - margin:
-                    tooltip_x = mouse_x - tooltip_w - margin
-                if tooltip_y + tooltip_h > screen_h - margin:
-                    tooltip_y = mouse_y - tooltip_h - margin
-
-                # Draw tooltip background
-                tooltip_rect = pygame.Rect(tooltip_x, tooltip_y, tooltip_w, tooltip_h)
-                border_radius = int(4 * scale)
-                pygame.draw.rect(surface, (50, 50, 55), tooltip_rect, border_radius=border_radius)
-                pygame.draw.rect(surface, (100, 100, 110), tooltip_rect, 1, border_radius=border_radius)
-                surface.blit(text_surf, (tooltip_x + padding, tooltip_y + padding))
-
-        # Draw search field tooltip
         if self.search_hovered and not self.collapsed:
             elapsed = time.time() - self.search_hover_start
-            if elapsed >= 0.5:  # Show tooltip after 500ms
-                tooltip_text = "Search shapes and groups by name"
+            if elapsed >= TOOLTIP_DELAY:
+                draw_tooltip_at_cursor(surface, font, "Search shapes and groups by name", scale)
 
-                # Create tooltip surface
-                padding = int(6 * scale)
-                margin = int(5 * scale)
-                cursor_offset = int(16 * scale)
-                text_surf = font.render(tooltip_text, True, (255, 255, 255))
-                tooltip_w = text_surf.get_width() + padding * 2
-                tooltip_h = text_surf.get_height() + padding * 2
 
-                # Position tooltip below and to the right of cursor
-                mouse_x, mouse_y = pygame.mouse.get_pos()
-                tooltip_x = mouse_x + cursor_offset
-                tooltip_y = mouse_y + cursor_offset
+class ImageryPanel:
+    """
+    Right-side collapsible panel for managing Imagery items.
+    Supports add, rename, delete operations and file drag-drop.
+    """
+    # Colors
+    BG_COLOR = (35, 35, 40)
+    HEADER_COLOR = (45, 45, 50)
+    ROW_COLOR = (40, 40, 45)
+    ROW_HOVER_COLOR = (55, 55, 65)
+    ROW_SELECTED_COLOR = (60, 90, 140)
+    TEXT_COLOR = (220, 220, 220)
+    TEXT_DIM_COLOR = (140, 140, 140)
+    BUTTON_COLOR = (55, 55, 65)
+    BUTTON_HOVER_COLOR = (70, 70, 85)
 
-                # Keep tooltip on screen
-                screen_w, screen_h = surface.get_size()
-                if tooltip_x + tooltip_w > screen_w - margin:
-                    tooltip_x = mouse_x - tooltip_w - margin
-                if tooltip_y + tooltip_h > screen_h - margin:
-                    tooltip_y = mouse_y - tooltip_h - margin
+    MIN_WIDTH = 180
+    MAX_WIDTH = 350
+    HEADER_HEIGHT = 70
+    ROW_HEIGHT = 40
+    THUMBNAIL_SIZE = 32
+    DETAILS_HEIGHT = 40  # Height of expanded details section (speed slider)
 
-                # Draw tooltip background
-                tooltip_rect = pygame.Rect(tooltip_x, tooltip_y, tooltip_w, tooltip_h)
-                border_radius = int(4 * scale)
-                pygame.draw.rect(surface, (50, 50, 55), tooltip_rect, border_radius=border_radius)
-                pygame.draw.rect(surface, (100, 100, 110), tooltip_rect, 1, border_radius=border_radius)
-                surface.blit(text_surf, (tooltip_x + padding, tooltip_y + padding))
+    COLLAPSED_WIDTH = 24
+    HANDLE_WIDTH = 24
+    CHEVRON_SIZE = 12
+
+    def __init__(self, app):
+        self.app = app
+        self.width = 220
+        self.scroll_offset = 0
+        self.max_scroll = 0
+        self.hovered_row: Union[ImageryItem, str, None] = None  # ImageryItem, "none", or None
+        self.selected_item: Optional[ImageryItem] = None
+
+        # Collapsed state
+        self.collapsed = True
+        self.hover_handle = False
+
+        # Animation state
+        self.animation_progress = 0.0
+        self.animating = False
+        self.animation_start = 0.0
+        self.animation_duration = 0.15
+
+        # Inline rename state
+        self.rename_item: Optional[ImageryItem] = None
+        self.rename_text: str = ""
+        self.rename_cursor: int = 0
+
+        # Double-click for rename
+        self.last_click_item: Optional[ImageryItem] = None
+        self.last_click_time: float = 0.0
+        self.double_click_threshold: float = 0.4
+
+        # Button hover state
+        self.hover_add_image = False
+        self.hover_add_anim = False
+        self.hover_add_capture = False
+        self.hover_add_pipe = False
+        self.hover_close_chevron = False  # Close chevron in header when expanded
+
+        # Tooltip state
+        self.chevron_hovered = False
+        self.chevron_hover_start = 0.0
+
+        # Expandable details state
+        self.expanded_item: Optional[ImageryItem] = None  # Currently expanded item
+        self.speed_slider_dragging = False  # Whether speed slider is being dragged
+        self.speed_slider_value = 1.0  # Current value while dragging
+
+    def update_animation(self):
+        """Update panel animation state."""
+        update_panel_animation(self)
+
+    def get_rect(self) -> pygame.Rect:
+        """Get panel rectangle based on animation progress."""
+        scale = self.app.ui_scale
+        handle_w = int(self.HANDLE_WIDTH * scale)
+        expanded_w = int(self.width * scale)
+        current_w = handle_w + int((expanded_w - handle_w) * self.animation_progress)
+        return pygame.Rect(WIDTH - current_w, 0, current_w, HEIGHT)
+
+    def _get_handle_rect(self) -> pygame.Rect:
+        """Get the clickable handle rectangle at left edge of panel."""
+        scale = self.app.ui_scale
+        handle_w = int(self.HANDLE_WIDTH * scale)
+        panel_rect = self.get_rect()
+        return pygame.Rect(panel_rect.x, 0, handle_w, HEIGHT)
+
+    def get_content_rect(self) -> pygame.Rect:
+        """Get content area rectangle (excluding header and handle)."""
+        scale = self.app.ui_scale
+        header_h = int(self.HEADER_HEIGHT * scale)
+        handle_w = int(self.HANDLE_WIDTH * scale)
+        panel_rect = self.get_rect()
+        return pygame.Rect(panel_rect.x + handle_w, header_h, panel_rect.width - handle_w, HEIGHT - header_h)
+
+    def _get_row_at(self, y: int) -> Union[ImageryItem, str, None]:
+        """Get imagery item at y position.
+
+        Returns:
+            ImageryItem: if an imagery item row was clicked
+            "none": if the "None" row was clicked (unassign imagery)
+            None: if no row was clicked
+        """
+        content_rect = self.get_content_rect()
+        if y < content_rect.top:
+            return None
+
+        row_h = int(self.ROW_HEIGHT * self.app.ui_scale)
+        details_h = int(self.DETAILS_HEIGHT * self.app.ui_scale)
+        rel_y = y - content_rect.top + self.scroll_offset
+
+        # Row 0 is the "None" option
+        if rel_y < row_h:
+            return "none"
+
+        # Account for variable row heights when expanded
+        current_y = row_h  # Start after "None" row
+        items = self.app.imagery_manager.get_items_list()
+        for item in items:
+            item_row_h = row_h
+            if self.expanded_item == item:
+                item_row_h += details_h
+            if rel_y < current_y + item_row_h:
+                return item
+            current_y += item_row_h
+        return None
+
+    def _get_add_buttons_rect(self) -> Tuple[pygame.Rect, pygame.Rect, pygame.Rect, pygame.Rect]:
+        """Get rectangles for Add Image, Add Anim, Add Capture, and Add Pipe buttons."""
+        scale = self.app.ui_scale
+        handle_w = int(self.HANDLE_WIDTH * scale)
+        panel_rect = self.get_rect()
+        margin = int(8 * scale)
+        btn_h = int(26 * scale)
+        btn_y = int(34 * scale)
+        gap = int(4 * scale)
+        content_w = panel_rect.width - handle_w - margin * 2
+        btn_w = (content_w - gap * 3) // 4
+
+        btn1 = pygame.Rect(panel_rect.x + handle_w + margin, btn_y, btn_w, btn_h)
+        btn2 = pygame.Rect(btn1.right + gap, btn_y, btn_w, btn_h)
+        btn3 = pygame.Rect(btn2.right + gap, btn_y, btn_w, btn_h)
+        btn4 = pygame.Rect(btn3.right + gap, btn_y, btn_w, btn_h)
+        return btn1, btn2, btn3, btn4
+
+    def _get_close_chevron_rect(self) -> pygame.Rect:
+        """Get the close chevron rectangle in header (upper right when expanded)."""
+        scale = self.app.ui_scale
+        chevron_size = int(self.CHEVRON_SIZE * scale)
+        panel_rect = self.get_rect()
+        margin = int(8 * scale)
+        # Position in upper right of header
+        cx = panel_rect.right - margin - chevron_size // 2
+        cy = int(20 * scale)
+        return pygame.Rect(cx - chevron_size, cy - chevron_size, chevron_size * 2, chevron_size * 2)
+
+    def _get_expand_chevron_rect(self, item: ImageryItem, row_y: int) -> Optional[pygame.Rect]:
+        """Get expand chevron click area for an animated or videopipe item row."""
+        if not item.is_animated() and not item.is_videopipe():
+            return None
+        scale = self.app.ui_scale
+        row_h = int(self.ROW_HEIGHT * scale)
+        chevron_size = int(10 * scale)
+        content_rect = self.get_content_rect()
+        margin = int(6 * scale)
+        # Position on right side of row, vertically centered
+        cx = content_rect.right - margin - chevron_size
+        cy = row_y + row_h // 2
+        return pygame.Rect(cx - chevron_size, cy - chevron_size, chevron_size * 2, chevron_size * 2)
+
+    def _get_speed_slider_rect(self, row_y: int) -> pygame.Rect:
+        """Get the speed slider rect within an expanded details section."""
+        scale = self.app.ui_scale
+        row_h = int(self.ROW_HEIGHT * scale)
+        details_h = int(self.DETAILS_HEIGHT * scale)
+        content_rect = self.get_content_rect()
+        margin = int(8 * scale)
+        slider_h = int(20 * scale)
+        # Position slider in details section below the row
+        slider_y = row_y + row_h + (details_h - slider_h) // 2
+        slider_w = content_rect.width - margin * 2 - int(60 * scale)  # Leave room for label
+        return pygame.Rect(content_rect.x + margin + int(60 * scale), slider_y, slider_w, slider_h)
+
+    def _get_pipe_button_rect(self, row_y: int) -> pygame.Rect:
+        """Get the pipe name button rect in expanded details section."""
+        scale = self.app.ui_scale
+        row_h = int(self.ROW_HEIGHT * scale)
+        details_h = int(self.DETAILS_HEIGHT * scale)
+        content_rect = self.get_content_rect()
+        margin = int(8 * scale)
+        name_x = content_rect.x + margin + int(40 * scale)
+        btn_y = row_y + row_h + 8
+        btn_w = content_rect.width - margin * 2 - int(40 * scale)
+        btn_h = details_h - 16
+        return pygame.Rect(name_x, btn_y, btn_w, btn_h)
+
+    def _show_pipe_selection_for_item(self, item: ImageryItem):
+        """Show pipe selection menu for an existing item."""
+        pipes = self.app.imagery_manager.get_available_pipes()
+        menu_items = []
+
+        for pipe_name in pipes:
+            menu_items.append((pipe_name, lambda pn=pipe_name: self._change_item_pipe(item, pn)))
+
+        menu_items.append(("Custom...", lambda: self._prompt_custom_pipe_for_item(item)))
+
+        btn_rect = self._get_pipe_button_rect(self._get_row_y_for_item(item))
+        self.app.context_menu.show(btn_rect.x, btn_rect.bottom + 2, menu_items)
+
+    def _change_item_pipe(self, item: ImageryItem, new_pipe_name: str):
+        """Change the pipe source for an existing videopipe item."""
+        item.cleanup_videopipe()
+        item.pipe_name = new_pipe_name
+        item.start_videopipe(new_pipe_name)
+        self.app.show_toast(f"Changed pipe to: {new_pipe_name}", 2.0, "success")
+
+    def _prompt_custom_pipe_for_item(self, item: ImageryItem):
+        """Prompt for custom pipe name for existing item."""
+        from tkinter import simpledialog
+        root = Tk()
+        root.withdraw()
+        pipe_name = simpledialog.askstring("Video Pipe", "Enter pipe name:",
+                                            initialvalue=item.pipe_name, parent=root)
+        root.destroy()
+
+        if pipe_name and pipe_name.strip():
+            self._change_item_pipe(item, pipe_name.strip())
+
+    def _get_row_y_for_item(self, target_item: ImageryItem) -> Optional[int]:
+        """Get the y position of a specific item's row (accounting for expanded items)."""
+        content_rect = self.get_content_rect()
+        row_h = int(self.ROW_HEIGHT * self.app.ui_scale)
+        details_h = int(self.DETAILS_HEIGHT * self.app.ui_scale)
+
+        current_y = content_rect.top - self.scroll_offset + row_h  # Start after "None" row
+        items = self.app.imagery_manager.get_items_list()
+        for item in items:
+            if item == target_item:
+                return current_y
+            item_row_h = row_h
+            if self.expanded_item == item:
+                item_row_h += details_h
+            current_y += item_row_h
+        return None
+
+    def _update_speed_slider_value(self, mouse_x: int, slider_rect: pygame.Rect):
+        """Update speed slider value based on mouse position."""
+        if self.expanded_item is None:
+            return
+
+        # Calculate ratio within slider
+        ratio = (mouse_x - slider_rect.x) / slider_rect.width
+        ratio = max(0.0, min(1.0, ratio))
+
+        # Map to speed range (0.1 to 10.0, logarithmic scale for better feel)
+        # Use log scale: 0.1 at ratio=0, 1.0 at ratio=0.5, 10.0 at ratio=1.0
+        min_speed = 0.1
+        max_speed = 10.0
+        # Linear mapping for simplicity
+        new_speed = min_speed + ratio * (max_speed - min_speed)
+
+        self.speed_slider_value = new_speed
+        self.expanded_item.playback_speed = new_speed
+
+        # Mark shapes using this imagery as dirty
+        for shape in self.app.shapes:
+            if shape.imagery_ref == self.expanded_item.id:
+                shape.gl_texture_dirty = True
+
+    def handle_event(self, event) -> bool:
+        """Handle event, returns True if consumed."""
+        handle_rect = self._get_handle_rect()
+        panel_rect = self.get_rect()
+
+        # Handle click on handle (toggle)
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.animating:
+                return panel_rect.collidepoint(event.pos)
+
+            # Check close chevron in upper right when expanded
+            if not self.collapsed and self.animation_progress > 0.95:
+                close_rect = self._get_close_chevron_rect()
+                if close_rect.collidepoint(event.pos):
+                    self.collapsed = True
+                    self.animating = True
+                    self.animation_start = time.time()
+                    return True
+
+            if handle_rect.collidepoint(event.pos):
+                self.collapsed = not self.collapsed
+                self.animating = True
+                self.animation_start = time.time()
+                return True
+
+            # Check Add buttons when expanded
+            if not self.collapsed and self.animation_progress > 0.95:
+                btn_image, btn_anim, btn_capture, btn_pipe = self._get_add_buttons_rect()
+                if btn_image.collidepoint(event.pos):
+                    self._add_image()
+                    return True
+                if btn_anim.collidepoint(event.pos):
+                    self._add_anim()
+                    return True
+                if btn_capture.collidepoint(event.pos):
+                    self._add_capture()
+                    return True
+                if btn_pipe.collidepoint(event.pos):
+                    self._add_pipe()
+                    return True
+
+                # Check expanded section clicks
+                if self.expanded_item is not None:
+                    row_y = self._get_row_y_for_item(self.expanded_item)
+                    if row_y is not None:
+                        # Speed slider for animated items
+                        if self.expanded_item.is_animated():
+                            slider_rect = self._get_speed_slider_rect(row_y)
+                            if slider_rect.collidepoint(event.pos):
+                                self.speed_slider_dragging = True
+                                self._update_speed_slider_value(event.pos[0], slider_rect)
+                                return True
+                        # Pipe button for videopipe items
+                        elif self.expanded_item.is_videopipe():
+                            pipe_btn_rect = self._get_pipe_button_rect(row_y)
+                            if pipe_btn_rect.collidepoint(event.pos):
+                                self._show_pipe_selection_for_item(self.expanded_item)
+                                return True
+
+                # Check row click
+                content_rect = self.get_content_rect()
+                if content_rect.collidepoint(event.pos):
+                    row_item = self._get_row_at(event.pos[1])
+                    if row_item is not None:
+                        # Handle "None" row click - unassign imagery
+                        if row_item == "none":
+                            self.app.assign_imagery_from_panel(None)
+                            return True
+
+                        # Check expand chevron click for animated or videopipe items
+                        row_y = self._get_row_y_for_item(row_item)
+                        if row_y is not None and (row_item.is_animated() or row_item.is_videopipe()):
+                            chevron_rect = self._get_expand_chevron_rect(row_item, row_y)
+                            if chevron_rect and chevron_rect.collidepoint(event.pos):
+                                # Toggle expansion
+                                if self.expanded_item == row_item:
+                                    self.expanded_item = None
+                                else:
+                                    self.expanded_item = row_item
+                                    if row_item.is_animated():
+                                        self.speed_slider_value = row_item.playback_speed
+                                return True
+
+                        # Handle imagery item row click
+                        current_time = time.time()
+                        if (self.last_click_item == row_item and
+                            current_time - self.last_click_time < self.double_click_threshold and
+                            self.selected_item == row_item):
+                            # Double-click - start rename
+                            self._start_rename(row_item)
+                            self.last_click_item = None
+                            return True
+
+                        self.last_click_item = row_item
+                        self.last_click_time = current_time
+                        self.selected_item = row_item
+
+                        # Assign imagery to selected shape(s)
+                        self.app.assign_imagery_from_panel(row_item.id)
+                        return True
+
+        # Handle speed slider drag
+        if event.type == pygame.MOUSEMOTION and self.speed_slider_dragging:
+            if self.expanded_item is not None:
+                row_y = self._get_row_y_for_item(self.expanded_item)
+                if row_y is not None:
+                    slider_rect = self._get_speed_slider_rect(row_y)
+                    self._update_speed_slider_value(event.pos[0], slider_rect)
+                    return True
+
+        # Handle speed slider release
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if self.speed_slider_dragging:
+                self.speed_slider_dragging = False
+                return True
+
+        # Handle hover
+        if event.type == pygame.MOUSEMOTION:
+            was_hovering = self.hover_handle
+            self.hover_handle = handle_rect.collidepoint(event.pos)
+
+            # Close chevron hover (upper right when expanded)
+            was_close_hover = self.hover_close_chevron
+            if not self.collapsed and self.animation_progress > 0.95:
+                close_rect = self._get_close_chevron_rect()
+                self.hover_close_chevron = close_rect.collidepoint(event.pos)
+            else:
+                self.hover_close_chevron = False
+
+            # Cursor handling
+            if self.hover_handle or self.hover_close_chevron:
+                pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
+            elif was_hovering or was_close_hover:
+                pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
+
+            # Tooltip tracking
+            was_chevron = self.chevron_hovered
+            self.chevron_hovered = handle_rect.collidepoint(event.pos)
+            if self.chevron_hovered and not was_chevron:
+                self.chevron_hover_start = time.time()
+
+            # Button hover
+            if not self.collapsed and self.animation_progress > 0.95:
+                btn_image, btn_anim, btn_capture, btn_pipe = self._get_add_buttons_rect()
+                self.hover_add_image = btn_image.collidepoint(event.pos)
+                self.hover_add_anim = btn_anim.collidepoint(event.pos)
+                self.hover_add_capture = btn_capture.collidepoint(event.pos)
+                self.hover_add_pipe = btn_pipe.collidepoint(event.pos)
+
+                # Row hover
+                content_rect = self.get_content_rect()
+                if content_rect.collidepoint(event.pos):
+                    self.hovered_row = self._get_row_at(event.pos[1])
+                else:
+                    self.hovered_row = None
+
+        # Handle rename keyboard
+        if self.rename_item is not None and event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_ESCAPE:
+                self._finish_rename(apply=False)
+                return True
+            elif event.key == pygame.K_RETURN:
+                self._finish_rename(apply=True)
+                return True
+            elif event.key == pygame.K_BACKSPACE:
+                if self.rename_cursor > 0:
+                    self.rename_text = self.rename_text[:self.rename_cursor-1] + self.rename_text[self.rename_cursor:]
+                    self.rename_cursor -= 1
+                return True
+            elif event.key == pygame.K_DELETE:
+                if self.rename_cursor < len(self.rename_text):
+                    self.rename_text = self.rename_text[:self.rename_cursor] + self.rename_text[self.rename_cursor+1:]
+                return True
+            elif event.key == pygame.K_LEFT:
+                self.rename_cursor = max(0, self.rename_cursor - 1)
+                return True
+            elif event.key == pygame.K_RIGHT:
+                self.rename_cursor = min(len(self.rename_text), self.rename_cursor + 1)
+                return True
+            elif event.unicode and event.unicode.isprintable():
+                self.rename_text = self.rename_text[:self.rename_cursor] + event.unicode + self.rename_text[self.rename_cursor:]
+                self.rename_cursor += 1
+                return True
+            return True
+
+        # Click outside rename
+        if self.rename_item is not None and event.type == pygame.MOUSEBUTTONDOWN:
+            item = self._get_row_at(event.pos[1])
+            if item != self.rename_item:
+                self._finish_rename(apply=True)
+
+        # Right click context menu
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+            if panel_rect.collidepoint(event.pos) and not self.collapsed:
+                content_rect = self.get_content_rect()
+                if content_rect.collidepoint(event.pos):
+                    item = self._get_row_at(event.pos[1])
+                    if item:
+                        self.selected_item = item
+                        self._show_context_menu(event.pos)
+                        return True
+
+        # Scroll
+        if event.type == pygame.MOUSEWHEEL:
+            if panel_rect.collidepoint(pygame.mouse.get_pos()) and not self.collapsed:
+                row_h = int(self.ROW_HEIGHT * self.app.ui_scale)
+                self.scroll_offset = max(0, min(self.max_scroll,
+                    self.scroll_offset - event.y * row_h * 3))
+                return True
+
+        # File drop
+        if event.type == pygame.DROPFILE:
+            if panel_rect.collidepoint(pygame.mouse.get_pos()) and not self.collapsed:
+                self._handle_file_drop(event.file)
+                return True
+
+        if self.collapsed and self.animation_progress < 0.05:
+            return handle_rect.collidepoint(getattr(event, 'pos', (-1, -1)))
+
+        return False
+
+    def _add_image(self):
+        """Open file dialog to add static image."""
+        root = Tk()
+        root.withdraw()
+        path = filedialog.askopenfilename(
+            title="Select Image",
+            filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff")]
+        )
+        root.destroy()
+        if path:
+            item = self.app.imagery_manager.create_item(path)
+            self.selected_item = item
+            self.app.show_toast(f"Added imagery: {item.name}", 2.0, "success")
+
+    def _add_anim(self):
+        """Open file dialog to add animation/video."""
+        root = Tk()
+        root.withdraw()
+        path = filedialog.askopenfilename(
+            title="Select Animation",
+            filetypes=[("Animation files", "*.gif;*.avi;*.mov;*.mp4")]
+        )
+        root.destroy()
+        if path:
+            item = self.app.imagery_manager.create_item(path)
+            self.selected_item = item
+            self.app.show_toast(f"Added animation: {item.name}", 2.0, "success")
+
+    def _add_capture(self):
+        """Add a desktop capture rect."""
+        if not DESKTOP_CAPTURE_AVAILABLE:
+            self.app.show_toast("Desktop capture not available", 2.0, "error")
+            return
+
+        item = self.app.imagery_manager.create_capture_item()
+        if item:
+            self.selected_item = item
+            item.show_overlay()
+            self.app.show_toast(f"Added capture: {item.name}", 2.0, "success")
+
+    def _add_pipe(self):
+        """Show dialog to add a video pipe receiver."""
+        if not VIDEOPIPE_AVAILABLE:
+            self.app.show_toast("Video pipes not available (SpoutGL not installed)", 2.0, "error")
+            return
+        self._show_pipe_dialog()
+
+    def _show_pipe_dialog(self):
+        """Show dialog for selecting/entering pipe name."""
+        pipes = self.app.imagery_manager.get_available_pipes()
+
+        # Build context menu items
+        menu_items = []
+
+        # Add available pipes
+        for pipe_name in pipes:
+            menu_items.append((pipe_name, lambda pn=pipe_name: self._create_pipe_item(pn)))
+
+        # Add custom option
+        menu_items.append(("Custom...", self._prompt_custom_pipe_name))
+
+        if not menu_items or (len(menu_items) == 1 and menu_items[0][0] == "Custom..."):
+            # No pipes found, go straight to custom input
+            self._prompt_custom_pipe_name()
+            return
+
+        # Show context menu at button position
+        btn_image, btn_anim, btn_capture, btn_pipe = self._get_add_buttons_rect()
+        self.app.context_menu.show(btn_pipe.x, btn_pipe.bottom + 2, menu_items)
+
+    def _prompt_custom_pipe_name(self):
+        """Prompt user for a custom pipe name using tkinter."""
+        from tkinter import simpledialog
+        root = Tk()
+        root.withdraw()
+        pipe_name = simpledialog.askstring("Video Pipe", "Enter pipe name:", parent=root)
+        root.destroy()
+
+        if pipe_name and pipe_name.strip():
+            self._create_pipe_item(pipe_name.strip())
+
+    def _create_pipe_item(self, pipe_name: str):
+        """Create a video pipe imagery item."""
+        item = self.app.imagery_manager.create_videopipe_item(pipe_name)
+        if item:
+            self.selected_item = item
+            self.app.show_toast(f"Added pipe: {item.name}", 2.0, "success")
+
+    def _handle_file_drop(self, file_path: str):
+        """Handle file dropped onto panel."""
+        ext = os.path.splitext(file_path)[1].lower()
+        valid_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.gif', '.avi', '.mov', '.mp4')
+        if ext in valid_exts:
+            item = self.app.imagery_manager.create_item(file_path)
+            self.selected_item = item
+            self.app.show_toast(f"Added: {item.name}", 2.0, "success")
+        else:
+            self.app.show_toast("Unsupported file type", 2.0, "error")
+
+    def _start_rename(self, item: ImageryItem):
+        """Start renaming an item."""
+        self.rename_item = item
+        self.rename_text = item.name
+        self.rename_cursor = len(self.rename_text)
+
+    def _finish_rename(self, apply: bool = True):
+        """Finish renaming."""
+        if self.rename_item and apply and self.rename_text.strip():
+            self.rename_item.name = self.rename_text.strip()
+        self.rename_item = None
+        self.rename_text = ""
+        self.rename_cursor = 0
+
+    def _show_context_menu(self, pos: Tuple[int, int]):
+        """Show context menu for selected item."""
+        if not self.selected_item:
+            return
+
+        items = [
+            ("Rename", lambda: self._start_rename(self.selected_item)),
+            ("Delete", lambda: self._delete_selected()),
+        ]
+
+        # Add toggle overlay option for capture items
+        if self.selected_item.is_capture():
+            overlay_label = "Hide Overlay" if self.selected_item.capture_overlay_visible else "Show Overlay"
+            items.insert(0, (overlay_label, lambda: self._toggle_overlay()))
+
+        self.app.context_menu.show(pos[0], pos[1], items)
+
+    def _toggle_overlay(self):
+        """Toggle overlay visibility for selected capture item."""
+        if self.selected_item and self.selected_item.is_capture():
+            self.selected_item.toggle_overlay()
+
+    def _delete_selected(self):
+        """Delete the selected imagery item."""
+        if not self.selected_item:
+            return
+
+        item_id = self.selected_item.id
+        item_name = self.selected_item.name
+
+        # Clear references in shapes
+        def clear_refs(deleted_id: str):
+            for shape in self.app.shapes:
+                if shape.imagery_ref == deleted_id:
+                    shape.imagery_ref = None
+                    shape.gl_texture_dirty = True
+
+        self.app.imagery_manager.delete_item(item_id, clear_refs)
+        self.selected_item = None
+        self.app.show_toast(f"Deleted: {item_name}", 2.0, "info")
+
+    def _draw_handle(self, surface, panel_rect: pygame.Rect):
+        """Draw the handle on the left edge of the panel."""
+        scale = self.app.ui_scale
+        handle_w = int(self.HANDLE_WIDTH * scale)
+
+        # Background
+        bg_color = (50, 50, 55) if self.hover_handle else (40, 40, 45)
+        handle_rect = pygame.Rect(panel_rect.x, 0, handle_w, HEIGHT)
+        pygame.draw.rect(surface, bg_color, handle_rect)
+
+        # Right border (separator from content)
+        pygame.draw.line(surface, (60, 60, 70),
+                         (panel_rect.x + handle_w - 1, 0), (panel_rect.x + handle_w - 1, HEIGHT), 1)
+
+        # Chevron at top (only when collapsed - expanded panel uses header close chevron)
+        chevron_size = int(self.CHEVRON_SIZE * scale)
+        cx = panel_rect.x + handle_w // 2
+        cy = int(20 * scale)
+
+        if self.collapsed:
+            # Left chevron (<) - expand
+            points = [
+                (cx + chevron_size // 3, cy - chevron_size // 2),
+                (cx - chevron_size // 3, cy),
+                (cx + chevron_size // 3, cy + chevron_size // 2)
+            ]
+            pygame.draw.lines(surface, (180, 180, 180), False, points, 2)
+
+        # Vertical text when collapsed
+        if self.animation_progress < 0.05:
+            text_surf = self.app.font_small.render("Imagery", True, (180, 180, 180))
+            rotated = pygame.transform.rotate(text_surf, 90)
+            text_x = cx - rotated.get_width() // 2
+            text_y = cy + chevron_size + int(10 * scale)
+            surface.blit(rotated, (text_x, text_y))
+
+    def _draw_panel_button(self, surface, rect: pygame.Rect, label: str,
+                          hovered: bool, enabled: bool = True):
+        """Draw a small panel button with hover and disabled states."""
+        if enabled:
+            bg_color = self.BUTTON_HOVER_COLOR if hovered else self.BUTTON_COLOR
+            text_color = self.TEXT_COLOR
+        else:
+            bg_color = (40, 40, 45)
+            text_color = (80, 80, 90)
+        pygame.draw.rect(surface, bg_color, rect, border_radius=3)
+        pygame.draw.rect(surface, (70, 70, 80), rect, 1, border_radius=3)
+        text_surf = self.app.font_small.render(label, True, text_color)
+        surface.blit(text_surf, (rect.x + (rect.width - text_surf.get_width()) // 2,
+                                 rect.y + (rect.height - text_surf.get_height()) // 2))
+
+    def draw(self, surface):
+        """Draw the imagery panel."""
+        self.update_animation()
+
+        scale = self.app.ui_scale
+        panel_rect = self.get_rect()
+        handle_w = int(self.HANDLE_WIDTH * scale)
+
+        # Draw handle
+        self._draw_handle(surface, panel_rect)
+
+        if self.animation_progress < 0.05:
+            return
+
+        content_x = panel_rect.x + handle_w
+        content_w = panel_rect.width - handle_w
+        header_h = int(self.HEADER_HEIGHT * scale)
+        row_h = int(self.ROW_HEIGHT * scale)
+        thumb_size = int(self.THUMBNAIL_SIZE * scale)
+
+        # Background
+        bg_rect = pygame.Rect(content_x, 0, content_w, HEIGHT)
+        pygame.draw.rect(surface, self.BG_COLOR, bg_rect)
+
+        # Header
+        header_rect = pygame.Rect(content_x, 0, content_w, header_h)
+        pygame.draw.rect(surface, self.HEADER_COLOR, header_rect)
+
+        # Header title (left side)
+        chevron_size = int(self.CHEVRON_SIZE * scale)
+        margin = int(8 * scale)
+        title_surf = self.app.font.render("Imagery", True, self.TEXT_COLOR)
+        surface.blit(title_surf, (content_x + margin, int(4 * scale)))
+
+        # Close chevron (upper right) - right-pointing chevron (>) to indicate collapse
+        close_rect = self._get_close_chevron_rect()
+        close_cx = close_rect.centerx
+        close_cy = close_rect.centery
+        chevron_color = (220, 220, 220) if self.hover_close_chevron else (180, 180, 180)
+        points = [
+            (close_cx - chevron_size // 3, close_cy - chevron_size // 2),
+            (close_cx + chevron_size // 3, close_cy),
+            (close_cx - chevron_size // 3, close_cy + chevron_size // 2)
+        ]
+        pygame.draw.lines(surface, chevron_color, False, points, 2)
+
+        # Add buttons
+        btn_image, btn_anim, btn_capture, btn_pipe = self._get_add_buttons_rect()
+
+        self._draw_panel_button(surface, btn_image, "Img", self.hover_add_image)
+        self._draw_panel_button(surface, btn_anim, "Anim", self.hover_add_anim)
+        self._draw_panel_button(surface, btn_capture, "Cap", self.hover_add_capture,
+                                enabled=DESKTOP_CAPTURE_AVAILABLE)
+        self._draw_panel_button(surface, btn_pipe, "Pipe", self.hover_add_pipe,
+                                enabled=VIDEOPIPE_AVAILABLE)
+
+        # Calculate scroll (include "None" row and account for expanded items)
+        items = self.app.imagery_manager.get_items_list()
+        content_rect = self.get_content_rect()
+        details_h = int(self.DETAILS_HEIGHT * scale)
+        total_height = row_h  # "None" row
+        for item in items:
+            total_height += row_h
+            if self.expanded_item == item:
+                total_height += details_h
+        self.max_scroll = max(0, total_height - content_rect.height)
+        self.scroll_offset = min(self.scroll_offset, self.max_scroll)
+
+        # Draw rows with clipping
+        old_clip = surface.get_clip()
+        surface.set_clip(content_rect)
+
+        y = content_rect.top - self.scroll_offset
+        margin = int(6 * scale)
+
+        # Draw "None" row first
+        if y + row_h > content_rect.top and y < content_rect.bottom:
+            self._draw_none_row(surface, y, row_h, content_x, content_w, margin)
+        y += row_h
+
+        # Draw imagery item rows (with variable heights for expanded items)
+        for item in items:
+            item_total_h = row_h
+            if self.expanded_item == item:
+                item_total_h += details_h
+
+            if y + item_total_h > content_rect.top and y < content_rect.bottom:
+                self._draw_row(surface, item, y, row_h, thumb_size, content_x, content_w)
+            y += item_total_h
+
+        surface.set_clip(old_clip)
+
+    def _draw_none_row(self, surface, y: int, row_h: int, content_x: int, content_w: int, margin: int):
+        """Draw the 'None' row for unassigning imagery."""
+        row_rect = pygame.Rect(content_x + 2, y, content_w - 4, row_h)
+
+        # Background - highlight if hovered
+        if self.hovered_row == "none":
+            pygame.draw.rect(surface, self.ROW_HOVER_COLOR, row_rect, border_radius=3)
+
+        # Draw "[None]" text with italic styling (dimmer color)
+        none_text = self.app.font_small.render("[None]", True, self.TEXT_DIM_COLOR)
+        text_y = y + (row_h - none_text.get_height()) // 2
+        surface.blit(none_text, (content_x + margin, text_y))
+
+    def _draw_row(self, surface, item: ImageryItem, y: int, row_h: int, thumb_size: int,
+                  content_x: int, content_w: int):
+        """Draw a single imagery row."""
+        scale = self.app.ui_scale
+        margin = int(6 * scale)
+
+        row_rect = pygame.Rect(content_x + 2, y, content_w - 4, row_h)
+
+        # Background
+        if self.selected_item == item:
+            pygame.draw.rect(surface, self.ROW_SELECTED_COLOR, row_rect, border_radius=3)
+        elif self.hovered_row == item:
+            pygame.draw.rect(surface, self.ROW_HOVER_COLOR, row_rect, border_radius=3)
+
+        # Thumbnail
+        thumb = item.get_thumbnail(thumb_size)
+        thumb_y = y + (row_h - thumb_size) // 2
+        surface.blit(thumb, (content_x + margin, thumb_y))
+
+        # Name (or rename field)
+        name_x = content_x + margin + thumb_size + margin
+        name_y = y + (row_h - self.app.font_small.get_height()) // 2
+
+        if self.rename_item == item:
+            # Draw rename input field
+            input_rect = pygame.Rect(name_x, name_y - 2, content_w - thumb_size - margin * 4, self.app.font_small.get_height() + 4)
+            pygame.draw.rect(surface, (70, 70, 80), input_rect, border_radius=2)
+            pygame.draw.rect(surface, (100, 180, 255), input_rect, 1, border_radius=2)
+
+            text_surf = self.app.font_small.render(self.rename_text, True, self.TEXT_COLOR)
+            surface.blit(text_surf, (name_x + 4, name_y))
+
+            # Cursor
+            cursor_x = name_x + 4 + self.app.font_small.size(self.rename_text[:self.rename_cursor])[0]
+            pygame.draw.line(surface, (220, 220, 220), (cursor_x, name_y), (cursor_x, name_y + self.app.font_small.get_height()), 1)
+        else:
+            name_surf = self.app.font_small.render(item.name, True, self.TEXT_COLOR)
+            # Clip name to available width
+            max_name_w = content_w - thumb_size - margin * 4
+            if name_surf.get_width() > max_name_w:
+                clip_rect = pygame.Rect(0, 0, max_name_w, name_surf.get_height())
+                surface.blit(name_surf, (name_x, name_y), clip_rect)
+            else:
+                surface.blit(name_surf, (name_x, name_y))
+
+        # Status indicators
+        if item.is_videopipe():
+            # Draw video pipe status indicator
+            indicator_x = content_x + content_w - margin - int(24 * scale)
+            indicator_y = y + row_h // 2
+            # Status colors: green = connected, yellow = waiting, red = disconnected
+            if item._pipe_connected:
+                status_color = (100, 200, 100)  # Green - connected
+            elif item._spout_receiver is not None:
+                status_color = (200, 180, 80)   # Yellow - waiting
+            else:
+                status_color = (200, 100, 100)  # Red - disconnected
+            pygame.draw.circle(surface, status_color, (indicator_x, indicator_y), int(4 * scale))
+
+            # Draw expand chevron for videopipe
+            self._draw_expand_chevron(surface, item, y, row_h, content_x, content_w, scale)
+
+            # Draw expanded details section if this item is expanded
+            if self.expanded_item == item:
+                self._draw_pipe_details_section(surface, item, y + row_h, content_x, content_w)
+
+        elif item.is_animated():
+            # Draw animated indicator (green dot)
+            indicator_x = content_x + content_w - margin - int(24 * scale)
+            indicator_y = y + row_h // 2
+            pygame.draw.circle(surface, (100, 200, 100), (indicator_x, indicator_y), int(4 * scale))
+
+            # Draw expand chevron
+            self._draw_expand_chevron(surface, item, y, row_h, content_x, content_w, scale)
+
+            # Draw expanded details section if this item is expanded
+            if self.expanded_item == item:
+                self._draw_details_section(surface, item, y + row_h, content_x, content_w)
+
+    def _draw_expand_chevron(self, surface, item: ImageryItem, y: int, row_h: int,
+                            content_x: int, content_w: int, scale: float):
+        """Draw the expand/collapse chevron for an expandable imagery row."""
+        margin = int(6 * scale)
+        chevron_size = int(8 * scale)
+        chevron_x = content_x + content_w - margin - int(10 * scale)
+        chevron_y = y + row_h // 2
+        if self.expanded_item == item:
+            # Down chevron (expanded)
+            points = [
+                (chevron_x - chevron_size // 2, chevron_y - chevron_size // 3),
+                (chevron_x, chevron_y + chevron_size // 3),
+                (chevron_x + chevron_size // 2, chevron_y - chevron_size // 3)
+            ]
+        else:
+            # Right chevron (collapsed)
+            points = [
+                (chevron_x - chevron_size // 3, chevron_y - chevron_size // 2),
+                (chevron_x + chevron_size // 3, chevron_y),
+                (chevron_x - chevron_size // 3, chevron_y + chevron_size // 2)
+            ]
+        pygame.draw.lines(surface, (180, 180, 180), False, points, 2)
+
+    def _draw_details_section(self, surface, item: ImageryItem, y: int, content_x: int, content_w: int):
+        """Draw the expanded details section with speed slider."""
+        scale = self.app.ui_scale
+        details_h = int(self.DETAILS_HEIGHT * scale)
+        margin = int(8 * scale)
+
+        # Background for details section
+        details_rect = pygame.Rect(content_x + 4, y, content_w - 8, details_h)
+        pygame.draw.rect(surface, (35, 35, 40), details_rect, border_radius=3)
+
+        # Speed label
+        label_text = self.app.font_small.render("Speed:", True, (160, 160, 160))
+        label_y = y + (details_h - label_text.get_height()) // 2
+        surface.blit(label_text, (content_x + margin, label_y))
+
+        # Speed slider
+        slider_rect = self._get_speed_slider_rect(y - int(self.ROW_HEIGHT * scale))
+        track_h = int(4 * scale)
+        track_y = slider_rect.y + (slider_rect.height - track_h) // 2
+
+        # Track background
+        pygame.draw.rect(surface, (60, 60, 70),
+                        (slider_rect.x, track_y, slider_rect.width, track_h),
+                        border_radius=2)
+
+        # Filled portion
+        min_speed = 0.1
+        max_speed = 10.0
+        ratio = (item.playback_speed - min_speed) / (max_speed - min_speed)
+        ratio = max(0.0, min(1.0, ratio))
+        filled_w = int(slider_rect.width * ratio)
+        pygame.draw.rect(surface, (80, 150, 220),
+                        (slider_rect.x, track_y, filled_w, track_h),
+                        border_radius=2)
+
+        # Handle
+        handle_x = slider_rect.x + filled_w
+        handle_y = track_y + track_h // 2
+        handle_r = int(6 * scale)
+        pygame.draw.circle(surface, (100, 180, 255), (handle_x, handle_y), handle_r)
+
+        # Value label
+        value_text = self.app.font_small.render(f"{item.playback_speed:.1f}x", True, (220, 220, 220))
+        value_x = slider_rect.right + margin
+        value_y = y + (details_h - value_text.get_height()) // 2
+        surface.blit(value_text, (value_x, value_y))
+
+    def _draw_pipe_details_section(self, surface, item: ImageryItem, y: int, content_x: int, content_w: int):
+        """Draw the expanded details section for videopipe with pipe selection."""
+        scale = self.app.ui_scale
+        details_h = int(self.DETAILS_HEIGHT * scale)
+        margin = int(8 * scale)
+
+        # Background for details section
+        details_rect = pygame.Rect(content_x + 4, y, content_w - 8, details_h)
+        pygame.draw.rect(surface, (35, 35, 40), details_rect, border_radius=3)
+
+        # "Pipe:" label
+        label_text = self.app.font_small.render("Pipe:", True, (160, 160, 160))
+        label_y = y + (details_h - label_text.get_height()) // 2
+        surface.blit(label_text, (content_x + margin, label_y))
+
+        # Current pipe name (clickable to change)
+        pipe_name = item.pipe_name or "(none)"
+        name_rect = self._get_pipe_button_rect(y - int(self.ROW_HEIGHT * scale))
+
+        # Draw pipe name button
+        hover = name_rect.collidepoint(pygame.mouse.get_pos())
+        btn_color = (55, 55, 65) if hover else (45, 45, 50)
+        pygame.draw.rect(surface, btn_color, name_rect, border_radius=3)
+        pygame.draw.rect(surface, (70, 70, 80), name_rect, 1, border_radius=3)
+
+        name_surf = self.app.font_small.render(pipe_name, True, (220, 220, 220))
+        # Clip name if too wide
+        max_w = name_rect.width - 12
+        if name_surf.get_width() > max_w:
+            clip_rect = pygame.Rect(0, 0, max_w, name_surf.get_height())
+            surface.blit(name_surf, (name_rect.x + 6, name_rect.y + (name_rect.height - name_surf.get_height()) // 2), clip_rect)
+        else:
+            surface.blit(name_surf, (name_rect.x + 6, name_rect.y + (name_rect.height - name_surf.get_height()) // 2))
+
+    def draw_tooltip(self, surface, font, scale=1.0):
+        """Draw tooltip if applicable."""
+        if self.chevron_hovered:
+            elapsed = time.time() - self.chevron_hover_start
+            if elapsed >= TOOLTIP_DELAY:
+                tooltip_text = "Expand imagery panel" if self.collapsed else "Collapse imagery panel"
+                draw_tooltip_at_cursor(surface, font, tooltip_text, scale)
 
 
 class Hayai:
@@ -3108,10 +5170,14 @@ class Hayai:
     MODE_EDIT_SHAPE = 2
     MODE_EDIT_WARP = 3
 
-    def __init__(self):
+    def __init__(self, width: int = None, height: int = None):
         global WIDTH, HEIGHT
         self.fullscreen = False
-        self.windowed_size = (BASE_WIDTH, BASE_HEIGHT)
+
+        # Use provided dimensions or default to BASE_WIDTH/HEIGHT
+        init_width = width if width is not None else BASE_WIDTH
+        init_height = height if height is not None else BASE_HEIGHT
+        self.windowed_size = (init_width, init_height)
 
         # Capture native display resolution BEFORE first set_mode() call
         desktop_sizes = pygame.display.get_desktop_sizes()
@@ -3119,15 +5185,15 @@ class Hayai:
 
         # OpenGL mode - use OPENGL | DOUBLEBUF flags
         pygame.display.gl_set_attribute(pygame.GL_STENCIL_SIZE, 8)
-        self.screen = pygame.display.set_mode((BASE_WIDTH, BASE_HEIGHT),
+        self.screen = pygame.display.set_mode((init_width, init_height),
                                                pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
         # Initialize OpenGL renderer
-        gl_renderer.init_gl(BASE_WIDTH, BASE_HEIGHT)
+        gl_renderer.init_gl(init_width, init_height)
 
         pygame.display.set_caption("Hayai : Rapid Projection Mapping")
 
         # Internal resolution
-        WIDTH, HEIGHT = BASE_WIDTH, BASE_HEIGHT
+        WIDTH, HEIGHT = init_width, init_height
 
         # Create a pygame surface for UI rendering (blitted on top of OpenGL)
         self.ui_surface = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
@@ -3229,6 +5295,11 @@ class Hayai:
         # Fonts (scaled)
         self.recreate_fonts()
 
+        # Create imagery manager (before UI so dropdown can reference it)
+        self.imagery_manager = ImageryManager()
+        # Set modal frame callback for rendering during capture overlay move/resize
+        self.imagery_manager.set_modal_frame_callback(self._render_frame)
+
         # Create UI buttons
         self.create_ui()
 
@@ -3238,8 +5309,9 @@ class Hayai:
         # Create UI scale slider
         self.create_scale_slider()
 
-        # Create hierarchy panel and context menu
-        self.hierarchy_panel = HierarchyPanel(self)
+        # Create hierarchy panel, imagery panel, and context menu
+        self.hierarchy_panel = ScenePanel(self)
+        self.imagery_panel = ImageryPanel(self)
         self.context_menu = ContextMenu()
 
         # Set initial button states based on current context
@@ -3689,6 +5761,12 @@ class Hayai:
         shapes_in_selection = [s for s in self.selected_items if isinstance(s, Shape)]
         self.selected_shape = shapes_in_selection[0] if shapes_in_selection else None
 
+        # Auto-select imagery in panel to match the selected shape's imagery_ref
+        if self.selected_shape and self.selected_shape.imagery_ref:
+            self.imagery_panel.selected_item = self.imagery_manager.get_item(self.selected_shape.imagery_ref)
+        else:
+            self.imagery_panel.selected_item = None
+
     def select_item(self, item: SceneItem, add_to_selection: bool = False,
                     range_select: bool = False, force_individual: bool = False):
         """
@@ -3856,34 +5934,33 @@ class Hayai:
         self.show_toast("Items deleted", 1.5, "info")
 
     def save_undo_state(self):
-        """Save current state for undo"""
-        self.undo_manager.save_state(self.scene_root)
+        """Save current state for undo (includes scene and imagery)"""
+        self.undo_manager.save_state(self.scene_root, self.imagery_manager)
+
+    def _apply_restored_state(self, result, action_name: str):
+        """Apply a restored undo/redo state, or show toast if nothing to restore."""
+        if result is None:
+            self.show_toast(f"Nothing to {action_name.lower()}", 1.5, "info")
+            return
+        restored_scene, restored_imagery = result
+        self.scene_root = restored_scene
+        if restored_imagery:
+            self.imagery_manager.from_dict(restored_imagery)
+        self.rebuild_parent_refs()
+        self.rebuild_shapes_list()
+        self.clear_selection()
+        self.selected_vertex = None
+        self.show_toast(action_name, 1.5, "info")
 
     def undo(self):
         """Undo last action"""
-        restored = self.undo_manager.undo(self.scene_root)
-        if restored is not None:
-            self.scene_root = restored
-            self.rebuild_parent_refs()
-            self.rebuild_shapes_list()
-            self.clear_selection()
-            self.selected_vertex = None
-            self.show_toast("Undo", 1.5, "info")
-        else:
-            self.show_toast("Nothing to undo", 1.5, "info")
+        self._apply_restored_state(
+            self.undo_manager.undo(self.scene_root, self.imagery_manager), "Undo")
 
     def redo(self):
         """Redo last undone action"""
-        restored = self.undo_manager.redo(self.scene_root)
-        if restored is not None:
-            self.scene_root = restored
-            self.rebuild_parent_refs()
-            self.rebuild_shapes_list()
-            self.clear_selection()
-            self.selected_vertex = None
-            self.show_toast("Redo", 1.5, "info")
-        else:
-            self.show_toast("Nothing to redo", 1.5, "info")
+        self._apply_restored_state(
+            self.undo_manager.redo(self.scene_root, self.imagery_manager), "Redo")
 
     def focus_next_button(self):
         """Move focus to the next button"""
@@ -4000,7 +6077,7 @@ class Hayai:
         self.btn_on_corner.disabled = True
 
         # ===== CENTER TOP ROW 2: MODE buttons =====
-        # Mode buttons: Edit Shape, Edit Warp, Move Shape (centered below creation row + "Edit" subtitle)
+        # Mode buttons: Modify Shape, Move Shape, Edit Keystone (centered below creation row + "Edit" subtitle)
         mode_btn_count = 3
         mode_total_width = mode_btn_count * btn_w + (mode_btn_count - 1) * gap
         mode_x = (WIDTH - mode_total_width) // 2
@@ -4008,77 +6085,47 @@ class Hayai:
         self.tools_edit_subtitle_y = create_y + btn_h + gap + self.section_gap
         mode_y = self.tools_edit_subtitle_y + subtitle_height
 
-        # Store Edit Shape position for sub-buttons
-        edit_shape_x = mode_x
-        self.btn_edit_shape = Button(mode_x, mode_y, btn_w, btn_h, "Edit Shape",
+        # Position 1: Modify Shape (formerly Edit Shape)
+        modify_shape_x = mode_x
+        self.btn_edit_shape = Button(mode_x, mode_y, btn_w, btn_h, "Modify Shape",
                                      lambda: self.set_mode(self.MODE_EDIT_SHAPE),
-                                     tooltip="Modify polygon vertices")
+                                     tooltip="Add, move, or delete polygon vertices")
         self.buttons.append(self.btn_edit_shape)
 
         mode_x += btn_w + gap
-        # Store Edit Warp position for sub-buttons
-        edit_warp_x = mode_x
-        self.btn_edit_warp = Button(mode_x, mode_y, btn_w, btn_h, "Edit Warp",
-                                    lambda: self.set_mode(self.MODE_EDIT_WARP),
-                                    tooltip="Adjust perspective corners")
-        self.buttons.append(self.btn_edit_warp)
-
-        mode_x += btn_w + gap
-        # Store Move Shape position for sub-buttons
+        # Position 2: Move Shape - store position for sub-buttons (fx/fy)
         move_shape_x = mode_x
         self.btn_move_shape = Button(mode_x, mode_y, btn_w, btn_h, "Move Shape",
                                      lambda: self.set_mode(self.MODE_MOVE_SHAPE),
                                      tooltip="Move and rotate shapes")
         self.buttons.append(self.btn_move_shape)
 
+        mode_x += btn_w + gap
+        # Position 3: Edit Keystone (formerly Edit Warp)
+        edit_keystone_x = mode_x
+        self.btn_edit_warp = Button(mode_x, mode_y, btn_w, btn_h, "Edit Keystone",
+                                    lambda: self.set_mode(self.MODE_EDIT_WARP),
+                                    tooltip="Adjust perspective and visual properties")
+        self.buttons.append(self.btn_edit_warp)
+
         # ===== SUB-BUTTONS UNDER MODE BUTTONS =====
         sub_btn_y = mode_y + btn_h + gap
         half_w = (btn_w - gap) // 2
 
-        # fx/fy under Move Shape
-        self.btn_flip_x = Button(move_shape_x, sub_btn_y, half_w, btn_h, "fx", self.flip_x,
+        # FlipX/FlipY under Modify Shape (position 1)
+        self.btn_flip_x = Button(modify_shape_x, sub_btn_y, half_w, btn_h, "FlipX", self.flip_x,
                                  tooltip="Flip Horizontal")
-        self.btn_flip_x.disabled = True  # Initially disabled (not in Move Shape mode)
+        self.btn_flip_x.disabled = True  # Initially disabled
         self.buttons.append(self.btn_flip_x)
-        self.btn_flip_y = Button(move_shape_x + half_w + gap, sub_btn_y, half_w, btn_h, "fy", self.flip_y,
+        self.btn_flip_y = Button(modify_shape_x + half_w + gap, sub_btn_y, half_w, btn_h, "FlipY", self.flip_y,
                                  tooltip="Flip Vertical")
         self.btn_flip_y.disabled = True
         self.buttons.append(self.btn_flip_y)
 
-        # Set Image / Fit Warp under Edit Warp
-        self.btn_set_image = Button(edit_warp_x, sub_btn_y, half_w, btn_h, "Image", self.set_image,
-                                    tooltip="Load image or GIF for shape")
-        self.btn_set_image.disabled = True  # Initially disabled (not in Edit Warp mode)
-        self.buttons.append(self.btn_set_image)
-        self.btn_fit_warp = Button(edit_warp_x + half_w + gap, sub_btn_y, half_w, btn_h, "Fit", self.fit_warp,
-                                   tooltip="Reset warp to shape bounds")
-        self.btn_fit_warp.disabled = True
-        self.buttons.append(self.btn_fit_warp)
-
-        # ===== SCENE PANEL (LEFT SIDE, TOP) =====
-        scene_panel_x = margin + int(HierarchyPanel.COLLAPSED_WIDTH * self.ui_scale)
-        scene_panel_y = self.panel_margin_v
-        scene_btn_x = scene_panel_x + panel_padding
-        scene_btn_y = scene_panel_y + panel_header_height
-
-        self.btn_save = Button(scene_btn_x, scene_btn_y, btn_w, btn_h, "Save Scene", self.save_scene,
-                               tooltip="Save project to file")
-        self.buttons.append(self.btn_save)
-
-        scene_btn_y += btn_h + gap
-        self.btn_load = Button(scene_btn_x, scene_btn_y, btn_w, btn_h, "Load Scene", self.load_scene,
-                               tooltip="Open saved project")
-        self.buttons.append(self.btn_load)
-
-        scene_btn_y += btn_h + gap
-        self.btn_new = Button(scene_btn_x, scene_btn_y, btn_w, btn_h, "New Scene", self.new_scene,
-                              tooltip="Clear and start fresh")
-        self.buttons.append(self.btn_new)
-
         # ===== DISPLAY PANEL (LEFT SIDE, BOTTOM) =====
         display_panel_width = int(120 * self.ui_scale)
         display_panel_height = int(285 * self.ui_scale)  # 6 buttons + slider + padding
-        display_panel_x = margin + int(HierarchyPanel.COLLAPSED_WIDTH * self.ui_scale)
+        display_panel_x = margin + int(ScenePanel.COLLAPSED_WIDTH * self.ui_scale)
         display_panel_y = HEIGHT - self.panel_margin_v - display_panel_height
         display_btn_x = display_panel_x + panel_padding
         display_btn_y = display_panel_y + panel_header_height
@@ -4153,13 +6200,19 @@ class Hayai:
                                     slider_width, input_height,
                                     label="Name", on_change=self.on_name_change)
 
-        # Image section position (drawn in draw_properties_panel)
-        y_offset += row_spacing
-        self.image_label_y = y_offset
-        self.image_field_y = y_offset + int(18 * self.ui_scale)
-
-        # Sliders with consistent spacing (section_gap before new section)
+        # ===== IMAGERY SOURCE SECTION =====
         y_offset += row_spacing + self.section_gap
+        self.source_section_y = y_offset  # Store for drawing section header
+        y_offset += int(20 * self.ui_scale)  # Space for section header
+
+        # Frame offset slider (for animation sync)
+        self.frame_offset_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
+                                          0.0, 100.0, 0.0, "Frame Offset %", self.on_frame_offset_change, "{:.0f}%",
+                                          tooltip="Offset animation timing for sync effects")
+        self.frame_offset_slider.disabled = True
+
+        # Alpha slider
+        y_offset += row_spacing
         self.alpha_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
                                    0.0, 1.0, 1.0, "Alpha", self.on_alpha_slider_change)
 
@@ -4175,11 +6228,19 @@ class Hayai:
         self.val_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
                                  0.0, 2.0, 1.0, "Brightness", self.on_val_change)
 
-        y_offset += row_spacing
-        self.speed_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
-                                   0.01, 10.0, 1.0, "Anim Speed", self.on_speed_change)
+        # ===== KEYSTONE SECTION =====
+        y_offset += row_spacing + self.section_gap
+        self.keystone_section_y = y_offset  # Store for drawing section header
+        y_offset += int(20 * self.ui_scale)  # Space for section header
 
-        y_offset += row_spacing
+        # Fit To Shape button in properties panel (not in main buttons list - handled separately)
+        btn_h = int(28 * self.ui_scale)
+        self.btn_fit_warp = Button(panel_x + padding, y_offset, slider_width, btn_h,
+                                   "Fit To Shape", self.fit_warp,
+                                   tooltip="Reset warp corners to shape bounds")
+        self.btn_fit_warp.disabled = True
+
+        y_offset += btn_h + int(8 * self.ui_scale)
         self.persp_x_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
                                      -1.0, 1.0, 0.0, "Perspective X", self.on_persp_x_change)
 
@@ -4187,8 +6248,9 @@ class Hayai:
         self.persp_y_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
                                      -1.0, 1.0, 0.0, "Perspective Y", self.on_persp_y_change)
 
-        self.properties_sliders = [self.alpha_slider, self.hue_slider,
-                                   self.sat_slider, self.val_slider, self.speed_slider,
+        self.properties_sliders = [self.frame_offset_slider,
+                                   self.alpha_slider, self.hue_slider,
+                                   self.sat_slider, self.val_slider,
                                    self.persp_x_slider, self.persp_y_slider]
 
         # Store panel dimensions for drawing
@@ -4203,6 +6265,67 @@ class Hayai:
             self.selected_shape.name = new_name
         elif len(self.selected_items) == 1 and isinstance(self.selected_items[0], Group):
             self.selected_items[0].name = new_name
+
+    def on_imagery_change(self, imagery_id: Optional[str]):
+        """Callback when imagery dropdown selection changes"""
+        if self.selected_shape:
+            self.selected_shape.imagery_ref = imagery_id
+            self.selected_shape.gl_texture_dirty = True
+            self.selected_shape._last_rendered_frame = -1
+            # Update frame offset slider enabled state
+            if imagery_id:
+                item = self.imagery_manager.get_item(imagery_id)
+                has_animation = item and item.is_animated()
+                self.frame_offset_slider.disabled = not has_animation
+            else:
+                self.frame_offset_slider.disabled = True
+
+    def assign_imagery_from_panel(self, imagery_id: Optional[str]):
+        """Assign imagery to selected shape(s) from panel click."""
+        shapes_to_update = []
+
+        # Collect all selected shapes (including from groups)
+        for item in self.selected_items:
+            if isinstance(item, Shape):
+                shapes_to_update.append(item)
+            elif isinstance(item, Group):
+                shapes_to_update.extend(item.get_all_shapes())
+
+        if not shapes_to_update:
+            return
+
+        # Apply to all selected shapes
+        for shape in shapes_to_update:
+            shape.imagery_ref = imagery_id
+            shape.gl_texture_dirty = True
+            shape._last_rendered_frame = -1
+
+        # Update properties panel if a single shape is selected
+        if self.selected_shape:
+            # Update frame offset slider enabled state
+            if imagery_id:
+                item = self.imagery_manager.get_item(imagery_id)
+                has_animation = item and item.is_animated()
+                self.frame_offset_slider.disabled = not has_animation
+            else:
+                self.frame_offset_slider.disabled = True
+
+        # Show toast
+        if imagery_id:
+            item = self.imagery_manager.get_item(imagery_id)
+            name = item.name if item else "Unknown"
+            count = len(shapes_to_update)
+            if count == 1:
+                self.show_toast(f"Assigned '{name}'", 1.5, "success")
+            else:
+                self.show_toast(f"Assigned '{name}' to {count} shapes", 1.5, "success")
+        else:
+            self.show_toast("Imagery cleared", 1.5, "info")
+
+    def on_frame_offset_change(self, value):
+        """Callback when frame offset slider is changed"""
+        if self.selected_shape:
+            self.selected_shape.frame_offset_percent = value
 
     def on_alpha_slider_change(self, value):
         """Callback when alpha slider is changed"""
@@ -4223,11 +6346,6 @@ class Hayai:
         """Callback when value/brightness slider is changed"""
         if self.selected_shape:
             self.selected_shape.color_value = value
-
-    def on_speed_change(self, value):
-        """Callback when playback speed slider is changed"""
-        if self.selected_shape and self.selected_shape.animation_frames:
-            self.selected_shape.playback_speed = value
 
     def on_persp_x_change(self, value):
         """Callback when perspective X slider is changed"""
@@ -4254,15 +6372,23 @@ class Hayai:
                 self.name_input.label = "Shape Name"
                 self.name_input.text = selected_item.name
                 self.name_input.cursor_pos = len(self.name_input.text)
+
+                # Update frame offset slider
+                self.frame_offset_slider.value = selected_item.frame_offset_percent
+
+                # Check if referenced imagery is animated
+                has_animation = False
+                if selected_item.imagery_ref:
+                    item = self.imagery_manager.get_item(selected_item.imagery_ref)
+                    if item:
+                        has_animation = item.is_animated()
+                self.frame_offset_slider.disabled = not has_animation
+
                 # Update sliders for Shape
                 self.alpha_slider.value = selected_item.alpha
                 self.hue_slider.value = selected_item.hue_shift
                 self.sat_slider.value = selected_item.saturation
                 self.val_slider.value = selected_item.color_value
-                self.speed_slider.value = selected_item.playback_speed
-                # Disable speed slider for non-animated images
-                has_animation = len(selected_item.animation_frames) > 1
-                self.speed_slider.disabled = not has_animation
                 # Sync perspective sliders
                 self.persp_x_slider.value = selected_item.perspective_x
                 self.persp_y_slider.value = selected_item.perspective_y
@@ -4271,6 +6397,8 @@ class Hayai:
                 self.name_input.label = "Group Name"
                 self.name_input.text = selected_item.name
                 self.name_input.cursor_pos = len(self.name_input.text)
+                # Disable shape-specific controls for groups
+                self.frame_offset_slider.disabled = True
                 self.last_selected_shape = None
 
             self.last_selected_item = selected_item
@@ -4295,8 +6423,8 @@ class Hayai:
         self.sides_entry.disabled = True
         self.btn_on_corner.disabled = True
         # Update sub-button disabled states based on mode
-        self.btn_flip_x.disabled = (mode != self.MODE_MOVE_SHAPE)
-        self.btn_flip_y.disabled = (mode != self.MODE_MOVE_SHAPE)
+        self.btn_flip_x.disabled = (mode != self.MODE_EDIT_SHAPE)
+        self.btn_flip_y.disabled = (mode != self.MODE_EDIT_SHAPE)
         # Update contextual button states (includes Image/Fit buttons)
         self.update_mode_button_states()
 
@@ -4319,41 +6447,46 @@ class Hayai:
         self.btn_edit_shape.disabled = not has_selected_shape
         self.btn_edit_warp.disabled = not has_selected_shape
 
-        # Image/Fit buttons: enabled only in Edit Warp mode with a shape selected
-        edit_warp_active = (self.mode == self.MODE_EDIT_WARP and has_selected_shape)
-        self.btn_set_image.disabled = not edit_warp_active
-        self.btn_fit_warp.disabled = not edit_warp_active
+        # Fit To Shape: enabled when a shape is selected
+        self.btn_fit_warp.disabled = not has_selected_shape
+
+    def _sync_display_toggle_button(self, button, label: str, state: bool):
+        """Helper to sync a display toggle button's text and active state."""
+        button.text = f"{label}: ON" if state else f"{label}: OFF"
+        button.active = not state
+
+    def sync_all_display_toggles(self):
+        """Sync all display toggle buttons with their current state values."""
+        self._sync_display_toggle_button(self.btn_geometry_toggle, "Geom", self.show_geom)
+        self._sync_display_toggle_button(self.btn_mask_toggle, "Mask", self.show_mask)
+        self._sync_display_toggle_button(self.btn_crosshair_toggle, "Cross", self.show_crosshair)
+        self._sync_display_toggle_button(self.btn_cursor_toggle, "Cursor", self.show_cursor)
+        self._sync_display_toggle_button(self.btn_grid_toggle, "Grid", self.show_grid)
+        self._sync_display_toggle_button(self.btn_controls_toggle, "Controls", self.show_controls)
+
+    def _toggle_display(self, attr: str, button, label: str):
+        """Toggle a display boolean and sync its button state."""
+        setattr(self, attr, not getattr(self, attr))
+        self._sync_display_toggle_button(button, label, getattr(self, attr))
 
     def toggle_geometry(self):
-        self.show_geom = not self.show_geom
-        self.btn_geometry_toggle.text = "Geom: ON" if self.show_geom else "Geom: OFF"
-        self.btn_geometry_toggle.active = not self.show_geom
+        self._toggle_display('show_geom', self.btn_geometry_toggle, "Geom")
 
     def toggle_mask(self):
-        self.show_mask = not self.show_mask
-        self.btn_mask_toggle.text = "Mask: ON" if self.show_mask else "Mask: OFF"
-        self.btn_mask_toggle.active = not self.show_mask
+        self._toggle_display('show_mask', self.btn_mask_toggle, "Mask")
 
     def toggle_crosshair(self):
-        self.show_crosshair = not self.show_crosshair
-        self.btn_crosshair_toggle.text = "Cross: ON" if self.show_crosshair else "Cross: OFF"
-        self.btn_crosshair_toggle.active = not self.show_crosshair
+        self._toggle_display('show_crosshair', self.btn_crosshair_toggle, "Cross")
 
     def toggle_cursor(self):
-        self.show_cursor = not self.show_cursor
-        self.btn_cursor_toggle.text = "Cursor: ON" if self.show_cursor else "Cursor: OFF"
-        self.btn_cursor_toggle.active = not self.show_cursor
+        self._toggle_display('show_cursor', self.btn_cursor_toggle, "Cursor")
         pygame.mouse.set_visible(not self.play_mode and self.show_cursor)
 
     def toggle_grid(self):
-        self.show_grid = not self.show_grid
-        self.btn_grid_toggle.text = "Grid: ON" if self.show_grid else "Grid: OFF"
-        self.btn_grid_toggle.active = not self.show_grid
+        self._toggle_display('show_grid', self.btn_grid_toggle, "Grid")
 
     def toggle_controls(self):
-        self.show_controls = not self.show_controls
-        self.btn_controls_toggle.text = "Controls: ON" if self.show_controls else "Controls: OFF"
-        self.btn_controls_toggle.active = not self.show_controls
+        self._toggle_display('show_controls', self.btn_controls_toggle, "Controls")
 
     def toggle_play_mode(self):
         self.play_mode = not self.play_mode
@@ -4465,52 +6598,40 @@ class Hayai:
         # Restore button states based on current mode
         if self.mode == self.MODE_MAKE_SHAPE:
             if self.placing_shape and self.pending_shape_type == "regular":
-                # Regular polygon placement
                 self.btn_create_freeform.active = False
                 self.btn_create_regular.active = True
             else:
-                # Freeform drawing mode
                 self.btn_create_freeform.active = True
                 self.btn_create_regular.active = False
         else:
-            # Non-MAKE_SHAPE modes - deactivate create buttons
             self.btn_create_freeform.active = False
             self.btn_create_regular.active = False
-            # Set the correct mode button active
             self.btn_move_shape.active = (self.mode == self.MODE_MOVE_SHAPE)
             self.btn_edit_shape.active = (self.mode == self.MODE_EDIT_SHAPE)
             self.btn_edit_warp.active = (self.mode == self.MODE_EDIT_WARP)
 
-        # Update sub-button disabled states (only enabled in Move Shape mode)
-        self.btn_flip_x.disabled = (self.mode != self.MODE_MOVE_SHAPE)
-        self.btn_flip_y.disabled = (self.mode != self.MODE_MOVE_SHAPE)
+        # Update sub-button disabled states
+        self.btn_flip_x.disabled = (self.mode != self.MODE_EDIT_SHAPE)
+        self.btn_flip_y.disabled = (self.mode != self.MODE_EDIT_SHAPE)
 
         # Restore on_corner button state
         self.btn_on_corner.text = "Corner: ON" if self.on_corner else "Corner: OFF"
         self.btn_on_corner.active = self.on_corner
 
-        # Restore display toggle button states
-        self.btn_geometry_toggle.text = "Geometry: ON" if self.show_geom else "Geometry: OFF"
-        self.btn_geometry_toggle.active = not self.show_geom
-        self.btn_mask_toggle.text = "Mask: ON" if self.show_mask else "Mask: OFF"
-        self.btn_mask_toggle.active = not self.show_mask
-        self.btn_cursor_toggle.text = "Cursor: ON" if self.show_cursor else "Cursor: OFF"
-        self.btn_cursor_toggle.active = not self.show_cursor
-        self.btn_crosshair_toggle.text = "Cross: ON" if self.show_crosshair else "Cross: OFF"
-        self.btn_crosshair_toggle.active = not self.show_crosshair
-        self.btn_grid_toggle.text = "Grid: ON" if self.show_grid else "Grid: OFF"
-        self.btn_grid_toggle.active = not self.show_grid
+        # Restore all display toggle button states
+        self.sync_all_display_toggles()
 
     def set_image(self):
+        """Open file dialog for static image files"""
         if not self.selected_shape:
             self.show_toast("Select a shape first", 2.0, "error")
             return
         root = Tk()
         root.withdraw()
         path = filedialog.askopenfilename(
-            title="Select Image or Animation",
+            title="Select Image",
             filetypes=[
-                ("Image files", "*.gif *.jpg *.jpeg *.png *.bmp"),
+                ("Image files", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff"),
                 ("All files", "*.*")
             ]
         )
@@ -4521,9 +6642,28 @@ class Hayai:
                 self.show_toast(f"Failed to load image: {error}", 4.0, "error")
             else:
                 self.show_toast("Image loaded", 2.0, "success")
-                # Update speed slider disabled state based on animation
-                has_animation = len(self.selected_shape.animation_frames) > 1
-                self.speed_slider.disabled = not has_animation
+
+    def set_anim(self):
+        """Open file dialog for animation/video files"""
+        if not self.selected_shape:
+            self.show_toast("Select a shape first", 2.0, "error")
+            return
+        root = Tk()
+        root.withdraw()
+        path = filedialog.askopenfilename(
+            title="Select Animation or Video",
+            filetypes=[
+                ("Animation files", "*.gif *.avi *.mov *.mp4"),
+                ("All files", "*.*")
+            ]
+        )
+        root.destroy()
+        if path:
+            error = self.selected_shape.load_image(path)
+            if error:
+                self.show_toast(f"Failed to load animation: {error}", 4.0, "error")
+            else:
+                self.show_toast("Animation loaded", 2.0, "success")
 
     def fit_warp(self):
         if self.selected_shape:
@@ -4593,11 +6733,13 @@ class Hayai:
             self.selected_shape.set_scale(self.selected_shape.scale + delta)
 
     def adjust_playback_speed(self, delta):
-        """Adjust playback speed of selected animated shape"""
-        if self.selected_shape and self.selected_shape.animation_frames:
-            self.save_undo_state()
-            new_speed = max(0.1, min(5.0, self.selected_shape.playback_speed + delta))
-            self.selected_shape.playback_speed = new_speed
+        """Adjust playback speed of selected shape's imagery"""
+        if self.selected_shape and self.selected_shape.imagery_ref:
+            item = self.imagery_manager.get_item(self.selected_shape.imagery_ref)
+            if item and item.is_animated():
+                self.save_undo_state()
+                new_speed = max(0.1, min(5.0, item.playback_speed + delta))
+                item.playback_speed = new_speed
 
     def save_scene(self):
         root = Tk()
@@ -4609,16 +6751,10 @@ class Hayai:
         )
         root.destroy()
         if path:
-            # Serialize scene_root (hierarchy format)
-            def serialize_items(items: List[SceneItem]) -> List[dict]:
-                result = []
-                for item in items:
-                    result.append(item.to_dict())
-                return result
-
             data = {
-                'version': 2,  # Version 2 = hierarchy format
-                'scene': serialize_items(self.scene_root)
+                'version': 3,  # Version 3 = imagery system
+                'imagery': self.imagery_manager.to_dict(),
+                'scene': [item.to_dict() for item in self.scene_root]
             }
             with open(path, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -4639,25 +6775,36 @@ class Hayai:
             # Check for version to determine format
             version = data.get('version', 1)
 
-            if version >= 2:
-                # New hierarchy format
-                def deserialize_items(items_data: List[dict]) -> List[SceneItem]:
-                    result = []
-                    for item_data in items_data:
-                        if item_data.get('type') == 'group':
-                            result.append(Group.from_dict(item_data))
-                        else:
-                            result.append(Shape.from_dict(item_data))
-                    return result
+            # Load imagery first (v3+)
+            if version >= 3:
+                self.imagery_manager.from_dict(data.get('imagery', {}))
+            else:
+                # Clear existing imagery for older files
+                self.imagery_manager.clear()
 
+            def deserialize_items(items_data: List[dict]) -> List[SceneItem]:
+                result = []
+                for item_data in items_data:
+                    if item_data.get('type') == 'group':
+                        result.append(Group.from_dict(item_data))
+                    else:
+                        result.append(Shape.from_dict(item_data))
+                return result
+
+            if version >= 2:
+                # Hierarchy format (v2+)
                 self.scene_root = deserialize_items(data.get('scene', []))
                 self.rebuild_parent_refs()
             else:
-                # Old flat format (backward compatibility)
+                # Old flat format (v1)
                 shapes = [Shape.from_dict(s) for s in data.get('shapes', [])]
-                self.scene_root = shapes  # Shapes at root level
+                self.scene_root = shapes
                 for shape in shapes:
                     shape._parent = None
+
+            # Migrate shapes with image_path to use imagery system (v1 and v2)
+            if version < 3:
+                self._migrate_shapes_to_imagery()
 
             # Rebuild flat shapes list
             self.rebuild_shapes_list()
@@ -4666,6 +6813,34 @@ class Hayai:
             # Update counters and assign names to unnamed items
             self._update_counters_from_scene()
             self.show_toast("Scene loaded", 2.0, "success")
+
+    def _migrate_shapes_to_imagery(self):
+        """Migrate shapes with legacy image_path to the centralized imagery system."""
+        # Collect unique image paths
+        path_to_item: Dict[str, ImageryItem] = {}
+
+        def migrate_shape(shape: Shape):
+            if shape.image_path and os.path.exists(shape.image_path):
+                # Check if we already created an imagery item for this path
+                if shape.image_path in path_to_item:
+                    item = path_to_item[shape.image_path]
+                else:
+                    # Create new imagery item
+                    item = self.imagery_manager.create_item(shape.image_path)
+                    path_to_item[shape.image_path] = item
+
+                # Link shape to imagery
+                shape.imagery_ref = item.id
+                shape.image_path = None  # Clear legacy field
+
+        def process_items(items: List[SceneItem]):
+            for item in items:
+                if isinstance(item, Shape):
+                    migrate_shape(item)
+                elif isinstance(item, Group):
+                    process_items(item.children)
+
+        process_items(self.scene_root)
 
     def _update_counters_from_scene(self):
         """Update shape and group counters based on loaded scene."""
@@ -4717,81 +6892,78 @@ class Hayai:
                 return
         self.scene_root = []
         self.shapes = []
+        self.imagery_manager.clear()  # Clear all imagery items
         self.clear_selection()
         self.current_contour = []
         self.shape_counter = 0  # Reset shape counter
         self.group_counter = 0  # Reset group counter
         self.show_toast("New scene created", 2.0, "info")
 
+    def copy_selection(self):
+        """Copy all selected items (shapes and groups) to clipboard."""
+        if not self.selected_items:
+            return
+        # Serialize all selected items using to_dict()
+        self.clipboard = [item.to_dict() for item in self.selected_items]
+        count = len(self.clipboard)
+        self.show_toast(f"Copied {count} item{'s' if count > 1 else ''}", 1.5, "info")
+
+    def paste_selection(self):
+        """Paste items from clipboard with offset."""
+        if not self.clipboard:
+            return
+        self.save_undo_state()
+        new_items = []
+
+        def assign_new_names(item):
+            """Recursively assign new unique names to item and children."""
+            if isinstance(item, Shape):
+                item.name = self.generate_shape_name()
+            elif isinstance(item, Group):
+                item.name = self.generate_group_name()
+                for child in item.children:
+                    assign_new_names(child)
+
+        for item_data in self.clipboard:
+            # Deserialize based on type
+            if item_data.get('type') == 'group':
+                new_item = Group.from_dict(item_data)
+            else:
+                new_item = Shape.from_dict(item_data)
+
+            # Assign unique names to the item and any children
+            assign_new_names(new_item)
+
+            # Offset position
+            if isinstance(new_item, Shape):
+                new_item.move(20, 20)
+            else:
+                # Move all shapes in group
+                for shape in new_item.get_all_shapes():
+                    shape.move(20, 20)
+
+            self.add_item_to_scene(new_item)
+            new_items.append(new_item)
+
+        # Select all pasted items
+        self.selected_items = new_items
+        self.update_selection_from_items()
+        self.update_mode_button_states()
+        count = len(new_items)
+        self.show_toast(f"Pasted {count} item{'s' if count > 1 else ''}", 1.5, "info")
+
+    # Legacy aliases for backward compatibility
     def copy_shape(self):
-        if self.selected_shape:
-            # Store shape data without the surface (which can't be pickled)
-            self.clipboard = {
-                'contour': self.selected_shape.contour.copy(),
-                'warp_points': self.selected_shape.warp_points.copy(),
-                'image_path': self.selected_shape.image_path,
-                'perspective_x': self.selected_shape.perspective_x,
-                'perspective_y': self.selected_shape.perspective_y,
-                'perspective_axis': self.selected_shape.perspective_axis,
-                'alpha': self.selected_shape.alpha,
-                'hue_shift': self.selected_shape.hue_shift,
-                'saturation': self.selected_shape.saturation,
-                'color_value': self.selected_shape.color_value,
-                'playback_speed': self.selected_shape.playback_speed,
-            }
-            self.show_toast("Shape copied", 1.5, "info")
+        """Legacy alias for copy_selection."""
+        self.copy_selection()
 
     def paste_shape(self):
-        if self.clipboard:
-            self.save_undo_state()
-            new_shape = Shape(
-                contour=[(x, y) for x, y in self.clipboard['contour']],
-                warp_points=[(x, y) for x, y in self.clipboard['warp_points']],
-                image_path=self.clipboard['image_path'],
-                perspective_x=self.clipboard['perspective_x'],
-                perspective_y=self.clipboard['perspective_y'],
-                perspective_axis=self.clipboard['perspective_axis'],
-                alpha=self.clipboard.get('alpha', 1.0),
-                hue_shift=self.clipboard.get('hue_shift', 0.0),
-                saturation=self.clipboard.get('saturation', 1.0),
-                color_value=self.clipboard.get('color_value', 1.0),
-                playback_speed=self.clipboard.get('playback_speed', 1.0),
-            )
-            # Assign a unique name
-            new_shape.name = self.generate_shape_name()
-            # Reload the image if there was one
-            if new_shape.image_path and os.path.exists(new_shape.image_path):
-                new_shape.load_image(new_shape.image_path)
-            new_shape.move(20, 20)  # Offset slightly
-            self.add_item_to_scene(new_shape)
-            self.select_item(new_shape)
-            self.show_toast("Shape pasted", 1.5, "info")
+        """Legacy alias for paste_selection."""
+        self.paste_selection()
 
     def delete_shape(self):
         """Delete all selected items (shapes and groups)."""
-        if not self.selected_items:
-            return
-
-        self.save_undo_state()
-
-        # Count items for toast message
-        num_shapes = sum(1 for item in self.selected_items if isinstance(item, Shape))
-        num_groups = sum(1 for item in self.selected_items if isinstance(item, Group))
-
-        # Delete all selected items
-        for item in list(self.selected_items):
-            self.remove_item_from_scene(item)
-
-        # Clear selection
-        self.clear_selection()
-
-        # Show appropriate toast
-        if num_groups > 0 and num_shapes > 0:
-            self.show_toast(f"Deleted {num_shapes} shape(s) and {num_groups} group(s)", 1.5, "info")
-        elif num_groups > 0:
-            self.show_toast(f"Deleted {num_groups} group(s)", 1.5, "info")
-        else:
-            self.show_toast(f"Deleted {num_shapes} shape(s)", 1.5, "info")
+        self.delete_selected_items()
 
     def get_warp_point_at(self, pos):
         if not self.selected_shape:
@@ -4915,8 +7087,8 @@ class Hayai:
         if len(shape.contour) < 3:
             return
 
-        # Get image to draw (supports animation) - call only once to avoid timing issues
-        img = shape.get_current_image()
+        # Get image to draw from imagery manager (supports animation sync)
+        img = shape.get_current_image(self.imagery_manager)
         if img is None:
             img = DEFAULT_PATTERN
 
@@ -4926,11 +7098,15 @@ class Hayai:
             world_warp = shape.get_world_warp_points()
             wp = [self.scale_point(x, y) for x, y in world_warp]
 
-            # For animated images, always update texture each frame
-            is_animated = len(shape.animation_frames) > 1
+            # Check if imagery needs per-frame texture updates (animated, capture, or video pipe)
+            needs_per_frame_update = False
+            if shape.imagery_ref:
+                item = self.imagery_manager.get_item(shape.imagery_ref)
+                if item:
+                    needs_per_frame_update = item.is_animated() or item.is_capture() or item.is_videopipe()
 
             # Create/update texture if needed
-            if shape.gl_texture_dirty or shape.gl_texture_id == 0 or is_animated:
+            if shape.gl_texture_dirty or shape.gl_texture_id == 0 or needs_per_frame_update:
                 if shape.gl_texture_id:
                     gl_renderer.delete_texture(shape.gl_texture_id)
                 shape.gl_texture_id, _, _ = gl_renderer.surface_to_texture(img)
@@ -5043,41 +7219,13 @@ class Hayai:
         min_x, min_y = self.scale_point(bounds[0], bounds[1])
         max_x, max_y = self.scale_point(bounds[2], bounds[3])
 
-        # Draw dashed rectangle
         color = (255, 200, 75)  # Orange-yellow
-        dash_length = 8
-        gap_length = 4
-        width = 2
-
-        def draw_dashed_line(start, end):
-            """Draw a dashed line between two points"""
-            dx = end[0] - start[0]
-            dy = end[1] - start[1]
-            length = math.sqrt(dx * dx + dy * dy)
-            if length == 0:
-                return
-            dx /= length
-            dy /= length
-
-            x, y = start
-            drawn = 0
-            while drawn < length:
-                # Start of dash
-                x1, y1 = x, y
-                # End of dash
-                dash_end = min(drawn + dash_length, length)
-                x2 = start[0] + dx * dash_end
-                y2 = start[1] + dy * dash_end
-                pygame.draw.line(self.ui_surface, color, (int(x1), int(y1)), (int(x2), int(y2)), width)
-                # Move to next dash
-                drawn = dash_end + gap_length
-                x = start[0] + dx * drawn
-                y = start[1] + dy * drawn
 
         # Draw the four sides
         corners = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
         for i in range(4):
-            draw_dashed_line(corners[i], corners[(i + 1) % 4])
+            draw_dashed_line(self.ui_surface, color, corners[i], corners[(i + 1) % 4],
+                           dash_length=8, gap_length=4, width=2)
 
         # Draw corner circles
         for cx, cy in corners:
@@ -5098,38 +7246,11 @@ class Hayai:
         min_x, min_y = self.scale_point(bounds[0], bounds[1])
         max_x, max_y = self.scale_point(bounds[2], bounds[3])
 
-        color = HANDLE_COLOR  # White
-        width = 1
-
-        def draw_marching_line(start: Tuple[float, float], end: Tuple[float, float]):
-            """Draw an animated dashed line between two points"""
-            dx = end[0] - start[0]
-            dy = end[1] - start[1]
-            length = math.sqrt(dx * dx + dy * dy)
-            if length == 0:
-                return
-            dx /= length
-            dy /= length
-
-            # Start drawing offset by march_offset for animation
-            pos = -self.march_offset
-            while pos < length:
-                # Start of dash
-                dash_start = max(0, pos)
-                dash_end = min(pos + MARCH_DASH, length)
-                if dash_end > 0 and dash_start < length:
-                    x1 = start[0] + dx * dash_start
-                    y1 = start[1] + dy * dash_start
-                    x2 = start[0] + dx * dash_end
-                    y2 = start[1] + dy * dash_end
-                    pygame.draw.line(self.ui_surface, color,
-                                   (int(x1), int(y1)), (int(x2), int(y2)), width)
-                pos += MARCH_DASH + MARCH_GAP
-
-        # Draw the four sides
+        # Draw the four sides with marching ants effect
         corners = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
         for i in range(4):
-            draw_marching_line(corners[i], corners[(i + 1) % 4])
+            draw_dashed_line(self.ui_surface, HANDLE_COLOR, corners[i], corners[(i + 1) % 4],
+                           dash_length=MARCH_DASH, gap_length=MARCH_GAP, offset=self.march_offset)
 
     def draw_marquee_rect(self):
         """
@@ -5156,34 +7277,9 @@ class Hayai:
 
         # Draw dashed border
         border_color = (100, 150, 255)  # Light blue
-        dash_length = 6
-        gap_length = 4
-
-        def draw_dashed_line(start: Tuple[float, float], end: Tuple[float, float]):
-            dx = end[0] - start[0]
-            dy = end[1] - start[1]
-            length = math.sqrt(dx * dx + dy * dy)
-            if length == 0:
-                return
-            dx /= length
-            dy /= length
-
-            pos = 0
-            while pos < length:
-                dash_start = pos
-                dash_end = min(pos + dash_length, length)
-                x1 = start[0] + dx * dash_start
-                y1 = start[1] + dy * dash_start
-                x2 = start[0] + dx * dash_end
-                y2 = start[1] + dy * dash_end
-                pygame.draw.line(self.ui_surface, border_color,
-                               (int(x1), int(y1)), (int(x2), int(y2)), 1)
-                pos += dash_length + gap_length
-
-        # Draw the four sides
         corners = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
         for i in range(4):
-            draw_dashed_line(corners[i], corners[(i + 1) % 4])
+            draw_dashed_line(self.ui_surface, border_color, corners[i], corners[(i + 1) % 4])
 
     def draw_marching_ants_quad(self, world_warp: List[Tuple[float, float]]):
         """Draw marching ants around warp quad edges"""
@@ -5196,27 +7292,9 @@ class Hayai:
         self.last_march_time = current_time
 
         screen_warp = [self.scale_point(wp[0], wp[1]) for wp in world_warp]
-        color = HANDLE_COLOR
-
-        def draw_marching_line(start, end):
-            dx, dy = end[0] - start[0], end[1] - start[1]
-            length = math.sqrt(dx * dx + dy * dy)
-            if length == 0:
-                return
-            dx, dy = dx / length, dy / length
-
-            pos = -self.march_offset
-            while pos < length:
-                dash_start = max(0, pos)
-                dash_end = min(pos + MARCH_DASH, length)
-                if dash_end > 0 and dash_start < length:
-                    x1, y1 = start[0] + dx * dash_start, start[1] + dy * dash_start
-                    x2, y2 = start[0] + dx * dash_end, start[1] + dy * dash_end
-                    pygame.draw.line(self.ui_surface, color, (int(x1), int(y1)), (int(x2), int(y2)), 1)
-                pos += MARCH_DASH + MARCH_GAP
-
         for i in range(4):
-            draw_marching_line(screen_warp[i], screen_warp[(i + 1) % 4])
+            draw_dashed_line(self.ui_surface, HANDLE_COLOR, screen_warp[i], screen_warp[(i + 1) % 4],
+                           dash_length=MARCH_DASH, gap_length=MARCH_GAP, offset=self.march_offset)
 
     def get_handle_at(self, pos: Tuple[float, float]) -> Optional[str]:
         """
@@ -5341,13 +7419,6 @@ class Hayai:
         edit_subtitle = self.font_small.render("Edit", True, subtitle_color)
         self.ui_surface.blit(edit_subtitle, (tools_panel_x + padding, self.tools_edit_subtitle_y))
 
-        # SCENE panel (left side, top)
-        scene_panel_width = int(120 * self.ui_scale)
-        scene_panel_height = int(138 * self.ui_scale)
-        scene_panel_x = base_margin + hierarchy_offset
-        scene_panel_y = self.panel_margin_v
-        draw_panel(scene_panel_x, scene_panel_y, scene_panel_width, scene_panel_height, "SCENE")
-
         # DISPLAY panel (left side, bottom) - 6 buttons + slider
         display_panel_width = int(120 * self.ui_scale)
         display_panel_height = int(285 * self.ui_scale)
@@ -5423,7 +7494,7 @@ class Hayai:
         elif is_group:
             panel_height = int(120 * self.ui_scale)
         else:
-            panel_height = int(420 * self.ui_scale)
+            panel_height = int(500 * self.ui_scale)
 
         # Draw panel background with rounded corners and border
         panel_rect = pygame.Rect(panel_x, panel_y, panel_width, panel_height)
@@ -5487,27 +7558,26 @@ class Hayai:
             # Draw name input
             self.name_input.draw(self.ui_surface, self.font_small, self.ui_scale)
 
-            # Draw image section with label and field box
-            label_text = self.font_small.render("Image", True, (180, 180, 180))
-            self.ui_surface.blit(label_text, (panel_x + padding, self.image_label_y))
+            # Draw IMAGERY SOURCE section header
+            source_header = self.font_small.render("IMAGERY SOURCE", True, (120, 120, 130))
+            self.ui_surface.blit(source_header, (panel_x + padding, self.source_section_y))
+            # Draw separator line after header
+            line_y = self.source_section_y + int(14 * self.ui_scale)
+            pygame.draw.line(self.ui_surface, (60, 60, 70),
+                           (panel_x + padding + source_header.get_width() + 8, line_y),
+                           (panel_x + padding + slider_width, line_y))
 
-            # Draw field box for image filename
-            field_height = int(22 * self.ui_scale)
-            field_rect = pygame.Rect(panel_x + padding, self.image_field_y, slider_width, field_height)
-            pygame.draw.rect(self.ui_surface, (40, 40, 48), field_rect, border_radius=4)
-            pygame.draw.rect(self.ui_surface, (60, 60, 70), field_rect, 1, border_radius=4)
+            # Draw KEYSTONE section header
+            keystone_header = self.font_small.render("KEYSTONE", True, (120, 120, 130))
+            self.ui_surface.blit(keystone_header, (panel_x + padding, self.keystone_section_y))
+            # Draw separator line after header
+            line_y = self.keystone_section_y + int(14 * self.ui_scale)
+            pygame.draw.line(self.ui_surface, (60, 60, 70),
+                           (panel_x + padding + keystone_header.get_width() + 8, line_y),
+                           (panel_x + padding + slider_width, line_y))
 
-            if shape.image_path:
-                # Show only filename, truncate if too long
-                filename = os.path.basename(shape.image_path)
-                max_width = slider_width - int(10 * self.ui_scale)
-                while self.font_small.size(filename)[0] > max_width and len(filename) > 4:
-                    filename = "..." + filename[4:]
-                path_text = self.font_small.render(filename, True, (160, 160, 160))
-            else:
-                path_text = self.font_small.render("(no image)", True, (100, 100, 100))
-            text_y = self.image_field_y + (field_height - path_text.get_height()) // 2
-            self.ui_surface.blit(path_text, (panel_x + padding + int(5 * self.ui_scale), text_y))
+            # Draw Fit To Shape button
+            self.btn_fit_warp.draw(self.ui_surface, self.font_small)
 
             # Draw sliders
             for slider in self.properties_sliders:
@@ -5656,6 +7726,10 @@ class Hayai:
             if self.hierarchy_panel.handle_event(event):
                 continue
 
+            # Handle imagery panel events
+            if self.imagery_panel.handle_event(event):
+                continue
+
             # Handle button events first if UI is visible
             if not self.play_mode:
                 for button in self.buttons:
@@ -5680,35 +7754,65 @@ class Hayai:
                     return
                 # Only handle shape-specific controls when a shape is selected
                 if self.selected_shape:
+                    # Handle properties panel buttons
+                    if self.btn_fit_warp.handle_event(event):
+                        return
                     for slider in self.properties_sliders:
                         if slider.handle_event(event):
                             return
 
-            # Handle drag-and-drop for images
+            # Handle drag-and-drop for images/videos
             if event.type == pygame.DROPFILE:
                 dropped_path = event.file
-                # Check if it's an image file
-                image_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp')
-                if dropped_path.lower().endswith(image_extensions):
+                # Check if it's an image or video file
+                media_extensions = ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff',
+                                    '.avi', '.mov', '.mp4')
+                if dropped_path.lower().endswith(media_extensions):
+                    # Create imagery item and assign to selected shape
+                    item = self.imagery_manager.create_item(dropped_path)
                     if self.selected_shape:
-                        error = self.selected_shape.load_image(dropped_path)
-                        if error:
-                            self.show_toast(f"Failed to load image: {error}", 4.0, "error")
-                        else:
-                            self.show_toast("Image loaded via drag-and-drop", 2.0, "success")
-                            # Update speed slider disabled state based on animation
-                            has_animation = len(self.selected_shape.animation_frames) > 1
-                            self.speed_slider.disabled = not has_animation
+                        self.selected_shape.imagery_ref = item.id
+                        self.selected_shape.gl_texture_dirty = True
+                        self.show_toast(f"Created imagery: {item.name}", 2.0, "success")
                     else:
-                        self.show_toast("Select a shape first to drop an image", 3.0, "error")
+                        self.show_toast("Created imagery (select shape to assign)", 2.0, "info")
                 else:
                     # Check if it's a scene file
                     if dropped_path.lower().endswith(('.hayai', '.json')):
                         try:
                             with open(dropped_path, 'r') as f:
                                 data = json.load(f)
-                            self.shapes = [Shape.from_dict(s) for s in data.get('shapes', [])]
-                            self.selected_shape = None
+                            # Use proper load_scene logic for v1/v2/v3 format
+                            version = data.get('version', 1)
+                            if version >= 3:
+                                self.imagery_manager.from_dict(data.get('imagery', {}))
+                            else:
+                                self.imagery_manager.clear()
+
+                            def deserialize_items(items_data):
+                                result = []
+                                for item_data in items_data:
+                                    if item_data.get('type') == 'group':
+                                        result.append(Group.from_dict(item_data))
+                                    else:
+                                        result.append(Shape.from_dict(item_data))
+                                return result
+
+                            if version >= 2:
+                                self.scene_root = deserialize_items(data.get('scene', []))
+                                self.rebuild_parent_refs()
+                            else:
+                                shapes = [Shape.from_dict(s) for s in data.get('shapes', [])]
+                                self.scene_root = shapes
+                                for shape in shapes:
+                                    shape._parent = None
+
+                            if version < 3:
+                                self._migrate_shapes_to_imagery()
+
+                            self.rebuild_shapes_list()
+                            self.clear_selection()
+                            self._update_counters_from_scene()
                             self.show_toast("Scene loaded via drag-and-drop", 2.0, "success")
                         except Exception as e:
                             self.show_toast(f"Failed to load scene: {e}", 4.0, "error")
@@ -5725,10 +7829,14 @@ class Hayai:
                     self.toggle_play_mode()
                 elif event.key == pygame.K_h:
                     # Toggle hierarchy panel collapsed/expanded state with animation
-                    import time
                     self.hierarchy_panel.collapsed = not self.hierarchy_panel.collapsed
                     self.hierarchy_panel.animating = True
                     self.hierarchy_panel.animation_start = time.time()
+                elif event.key == pygame.K_i:
+                    # Toggle imagery panel collapsed/expanded state with animation
+                    self.imagery_panel.collapsed = not self.imagery_panel.collapsed
+                    self.imagery_panel.animating = True
+                    self.imagery_panel.animation_start = time.time()
                 elif event.key == pygame.K_g and pygame.key.get_mods() & pygame.KMOD_CTRL:
                     if pygame.key.get_mods() & pygame.KMOD_SHIFT:
                         # Ctrl+Shift+G: Ungroup
@@ -5781,6 +7889,9 @@ class Hayai:
                             new_shape = Shape(contour=self.current_contour.copy())
                             new_shape.name = self.generate_shape_name()
                             new_shape.fit_warp_to_contour()
+                            # Auto-assign selected imagery from panel
+                            if self.imagery_panel.selected_item:
+                                new_shape.imagery_ref = self.imagery_panel.selected_item.id
                             self.add_item_to_scene(new_shape)
                             self.current_contour = []  # Clear before select_item so button states update correctly
                             self.select_item(new_shape)
@@ -5832,6 +7943,9 @@ class Hayai:
                             new_shape = Shape(contour=contour)
                             new_shape.name = self.generate_shape_name()
                             new_shape.fit_warp_to_contour()
+                            # Auto-assign selected imagery from panel
+                            if self.imagery_panel.selected_item:
+                                new_shape.imagery_ref = self.imagery_panel.selected_item.id
                             self.add_item_to_scene(new_shape)
                             self.select_item(new_shape)
                             self.show_toast("Shape created", 1.5, "success")
@@ -5847,6 +7961,9 @@ class Hayai:
                                 new_shape = Shape(contour=self.current_contour.copy())
                                 new_shape.name = self.generate_shape_name()
                                 new_shape.fit_warp_to_contour()
+                                # Auto-assign selected imagery from panel
+                                if self.imagery_panel.selected_item:
+                                    new_shape.imagery_ref = self.imagery_panel.selected_item.id
                                 self.add_item_to_scene(new_shape)
                                 self.current_contour = []  # Clear before select_item so button states update correctly
                                 self.select_item(new_shape)
@@ -6217,6 +8334,26 @@ class Hayai:
                             # Sync slider
                             self.persp_y_slider.value = self.selected_shape.perspective_y
 
+    def _render_frame(self):
+        """Minimal render cycle for modal overlay operations.
+
+        Only renders shapes with updated textures - skips UI overlays,
+        grid, panels, tooltips etc. for performance during drag operations.
+        """
+        # Update captures and animations
+        self.imagery_manager.update_animations()
+
+        # Clear screen
+        bg = BG_COLOR if self.play_mode else BG_COLOR_UI
+        gl_renderer.clear(bg[0], bg[1], bg[2])
+
+        # Render shapes only (this updates textures from capture sources)
+        for shape in self.shapes:
+            self.draw_shape_gl(shape, selected=False)
+
+        # Swap buffers
+        pygame.display.flip()
+
     def draw(self):
         bg = BG_COLOR if self.play_mode else BG_COLOR_UI
 
@@ -6293,26 +8430,33 @@ class Hayai:
             watermark_y = HEIGHT - watermark_surface.get_height() - int(10 * self.ui_scale)
             self.ui_surface.blit(watermark_surface, (watermark_x, watermark_y))
 
-        # Draw hierarchy panel (hidden in play mode)
+        # Draw hierarchy panel and imagery panel (hidden in play mode)
         if not self.play_mode:
             self.hierarchy_panel.draw(self.ui_surface)
+            self.imagery_panel.draw(self.ui_surface)
 
-        # Draw tooltips last (on top of everything including hierarchy panel)
-        # Suppress UI element tooltips when cursor is over hierarchy panel
+        # Draw tooltips last (on top of everything including panels)
+        # Suppress UI element tooltips when cursor is over hierarchy or imagery panel
         mouse_pos = pygame.mouse.get_pos()
-        panel_rect = self.hierarchy_panel.get_rect()
-        over_panel = panel_rect.collidepoint(mouse_pos) and not self.play_mode
+        hierarchy_rect = self.hierarchy_panel.get_rect()
+        imagery_rect = self.imagery_panel.get_rect()
+        over_panel = ((hierarchy_rect.collidepoint(mouse_pos) or
+                       imagery_rect.collidepoint(mouse_pos)) and not self.play_mode)
 
         if not over_panel:
             for button in self.buttons:
                 button.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
+            # Draw properties panel button tooltips
+            if self.selected_shape:
+                self.btn_fit_warp.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
             # Draw slider and numeric entry tooltips
             self.ui_scale_slider.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
             self.sides_entry.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
 
-        # Draw hierarchy panel tooltip (always shown when appropriate)
+        # Draw panel tooltips (always shown when appropriate)
         if not self.play_mode:
             self.hierarchy_panel.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
+            self.imagery_panel.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
 
         # Draw context menu (always on top)
         self.context_menu.draw(self.ui_surface, self.font)
@@ -6344,6 +8488,12 @@ class Hayai:
         self.btn_create_freeform.active = True
 
         while self.running:
+            # Update master animation timing for all imagery items
+            self.imagery_manager.update_animations()
+
+            # Process Windows messages for capture overlay windows
+            self.imagery_manager.process_overlay_messages()
+
             self.handle_events()
             self.draw()
             self.clock.tick(60)
@@ -6351,8 +8501,192 @@ class Hayai:
         pygame.quit()
 
 
+# ============================================================================
+# Command-Line Argument Handling
+# ============================================================================
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description='Hayai - Rapid Projection Mapping Tool',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  %(prog)s                              # Display 1, default size (2560x1440)
+  %(prog)s --screen 2                   # Display 2, 50%% of display size, centered
+  %(prog)s --screen 2 --geometry 1280x720        # Display 2, 1280x720, centered
+  %(prog)s --screen 2 --geometry 800x600+100+50  # Display 2, size and position
+        '''
+    )
+    parser.add_argument(
+        '--screen',
+        type=int,
+        default=None,
+        metavar='N',
+        help='Display/screen number (1-indexed, matches Windows Display Settings)'
+    )
+    parser.add_argument(
+        '--geometry',
+        type=str,
+        default=None,
+        metavar='WxH[+X+Y]',
+        help='Window geometry in X11 format: WIDTHxHEIGHT or WIDTHxHEIGHT+X+Y'
+    )
+    return parser.parse_args()
+
+
+def parse_geometry(geometry_str: str) -> Optional[Tuple[int, int, Optional[int], Optional[int]]]:
+    """Parse X11-style geometry string: WIDTHxHEIGHT[+X+Y]
+
+    Returns (width, height, x, y) where x and y may be None if not specified.
+    Returns None if the string is invalid.
+    """
+    match = re.match(r'^(\d+)x(\d+)(?:\+(\d+)\+(\d+))?$', geometry_str)
+    if not match:
+        return None
+    width, height = int(match.group(1)), int(match.group(2))
+    x = int(match.group(3)) if match.group(3) else None
+    y = int(match.group(4)) if match.group(4) else None
+    return width, height, x, y
+
+
+def get_display_info() -> List[Dict[str, int]]:
+    """Get information about available displays.
+
+    Must be called after pygame.init() but before creating the main window.
+    Returns list of dicts with 'index' (0-based internal), 'display_num' (1-based for user),
+    'x', 'y' (display position), 'width', and 'height'.
+    """
+    num_displays = pygame.display.get_num_displays()
+    desktop_sizes = pygame.display.get_desktop_sizes()
+    displays = []
+
+    # Try to get display bounds (position + size) using SDL
+    try:
+        # SDL_Rect structure for SDL_GetDisplayBounds
+        class SDL_Rect(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int),
+                        ("w", ctypes.c_int), ("h", ctypes.c_int)]
+
+        # Get SDL2 library from pygame
+        if sys.platform == 'win32':
+            pygame_dir = os.path.dirname(pygame.__file__)
+            sdl2_path = os.path.join(pygame_dir, 'SDL2.dll')
+            sdl2 = ctypes.CDLL(sdl2_path)
+        else:
+            sdl2 = ctypes.CDLL(None)  # Use default on other platforms
+
+        sdl2.SDL_GetDisplayBounds.argtypes = [ctypes.c_int, ctypes.POINTER(SDL_Rect)]
+        sdl2.SDL_GetDisplayBounds.restype = ctypes.c_int
+
+        for i in range(num_displays):
+            rect = SDL_Rect()
+            if sdl2.SDL_GetDisplayBounds(i, ctypes.byref(rect)) == 0:
+                displays.append({
+                    'index': i,
+                    'display_num': i + 1,
+                    'x': rect.x,
+                    'y': rect.y,
+                    'width': rect.w,
+                    'height': rect.h
+                })
+            else:
+                # Fallback if SDL call fails for this display
+                displays.append({
+                    'index': i,
+                    'display_num': i + 1,
+                    'x': 0,
+                    'y': 0,
+                    'width': desktop_sizes[i][0],
+                    'height': desktop_sizes[i][1]
+                })
+    except Exception:
+        # Fallback: assume horizontal layout starting at 0,0
+        x_offset = 0
+        for i in range(num_displays):
+            displays.append({
+                'index': i,
+                'display_num': i + 1,
+                'x': x_offset,
+                'y': 0,
+                'width': desktop_sizes[i][0],
+                'height': desktop_sizes[i][1]
+            })
+            x_offset += desktop_sizes[i][0]
+
+    return displays
+
+
 def main():
-    app = Hayai()
+    args = parse_args()
+
+    # Initialize pygame minimally to query display info
+    pygame.init()
+    displays = get_display_info()
+    pygame.quit()
+
+    # Show available displays
+    print("Available displays:")
+    for d in displays:
+        print(f"  Display {d['display_num']}: pos=({d['x']}, {d['y']}) size={d['width']}x{d['height']}")
+
+    # Determine which screen to use (user provides 1-based, we use 0-based internally)
+    if args.screen is not None:
+        if args.screen < 1 or args.screen > len(displays):
+            print(f"Error: Display {args.screen} not found. Available: 1-{len(displays)}")
+            sys.exit(1)
+        screen_index = args.screen - 1  # Convert 1-based to 0-based
+    else:
+        # Default to display 1 (index 0)
+        screen_index = 0
+
+    selected_display = displays[screen_index]
+
+    # Determine window size based on scenario
+    pos_x = None
+    pos_y = None
+
+    if args.geometry:
+        # User specified geometry - parse and use it
+        parsed = parse_geometry(args.geometry)
+        if parsed is None:
+            print(f"Error: Invalid geometry format '{args.geometry}'")
+            print("Expected format: WIDTHxHEIGHT or WIDTHxHEIGHT+X+Y (e.g., 1280x720 or 800x600+100+50)")
+            sys.exit(1)
+        width, height, pos_x, pos_y = parsed
+    elif args.screen is not None:
+        # Screen specified without geometry - use 50% of display dimensions
+        width = selected_display['width'] // 2
+        height = selected_display['height'] // 2
+    else:
+        # No parameters - default size
+        width = BASE_WIDTH
+        height = BASE_HEIGHT
+
+    # Calculate window position for the selected display
+    if pos_x is not None and pos_y is not None:
+        # Absolute position specified by user
+        window_x, window_y = pos_x, pos_y
+    else:
+        # Center on selected display using actual display bounds
+        display_x = selected_display['x']
+        display_y = selected_display['y']
+        display_w = selected_display['width']
+        display_h = selected_display['height']
+
+        window_x = display_x + (display_w - width) // 2
+        window_y = display_y + (display_h - height) // 2
+
+    # Set SDL environment variable for window position
+    os.environ['SDL_VIDEO_WINDOW_POS'] = f'{window_x},{window_y}'
+
+    print(f"Starting on display {selected_display['display_num']} ({selected_display['width']}x{selected_display['height']})")
+    print(f"Window: {width}x{height} at ({window_x}, {window_y})")
+
+    # Re-initialize pygame (was quit after getting display info)
+    pygame.init()
+
+    app = Hayai(width=width, height=height)
     app.run()
 
 
