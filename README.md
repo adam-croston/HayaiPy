@@ -1,4 +1,4 @@
-# Hayai
+# Hayai v1.1
 
 **Rapid Video Projection Mapping for Everyone**
 
@@ -9,20 +9,20 @@ Hayai is a fast, free, and beginner-friendly projection mapping tool with perspe
 - **Beginner-Friendly** - Intuitive UI with on-screen hints and tooltips
 - **Fast Setup** - Create and map shapes in seconds, not hours
 - **Live Performance Ready** - GPU-accelerated OpenGL rendering for smooth real-time playback
+- **Groups & Hierarchy** - Organize shapes into groups for easier management
+- **Imagery Management** - Centralized panel for managing all texture sources
 - **Perspective Correction** - Advanced inverse bilinear interpolation for accurate texture Keystoneing
 - **Animation Support** - Load animated GIFs and video files directly onto shapes
 - **Desktop Capture** - Capture any region of your desktop as a live texture source
 - **Video Pipe Input** - Receive live video from other applications via Spout
 - **HSV Color Control** - Adjust hue, saturation, value, and alpha per shape
-- **Imagery Management** - Centralized panel for managing all texture sources
-- **Groups & Hierarchy** - Organize shapes into groups for easier management
-- **100% Free** - Open source under Creative Commons BY-SA 4.0
+- **Free for Non-Commercial Use** - Licensed under PolyForm Noncommercial 1.0.0
 
 ## Installation
 
 > **Primary platform: Windows.**
-- Core features (shape creation, texture mapping, animations) should work on macOS and Linux but have not been tested.
-- Desktop Capture and Video Pipe (Spout) features currerntly requires Windows.
+- Core features (shape creation, texture mapping, animations) should work on macOS and Linux but **have not been tested**.
+- Desktop Capture and Video Pipe (Spout) features **currently requires Windows**.
 
 ### Step 1 - Install Python
 
@@ -214,9 +214,13 @@ Hayai is designed for video projection mapping where the projector displays onto
 |-----|--------|
 | `SPACE` | Toggle UI visibility (play mode) |
 | `F11` | Toggle fullscreen |
-| `ESC` | Exit fullscreen / Cancel freeform shape |
-| `H` | Toggle hierarchy panel |
+| `ESC` | Cancel freeform shape / Deselect vertex / Deselect shape |
+| `S` | Toggle scene panel |
 | `I` | Toggle imagery panel |
+| `T` | Toggle tools panel |
+| `U` | Toggle UI (display) panel |
+| `P` | Toggle properties panel |
+| `H` / `?` | Toggle hints panel |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Y` | Redo |
 | `Ctrl+C` | Copy selected |
@@ -237,7 +241,7 @@ Hayai is designed for video projection mapping where the projector displays onto
 | Right-drag | Rotate selection |
 | Mouse wheel | Scale selection (Ctrl=1%, Shift=10%) |
 | `DEL` | Delete selected |
-| `fx` / `fy` buttons | Flip horizontal / vertical |
+| `FlipX` / `FlipY` buttons | Flip horizontal / vertical |
 
 #### Edit Shape Mode
 | Input | Action |
@@ -290,7 +294,7 @@ The collapsible panel on the right edge manages all texture sources. Press **I**
 
 ### Properties Panel
 
-The right-side panel adapts to your selection:
+The collapsible properties panel (press **P** or click the header) adapts to your selection:
 
 **Single Shape:**
 - **Name** - Editable shape name
@@ -307,12 +311,16 @@ The right-side panel adapts to your selection:
 
 ### Display Options
 
+The collapsible UI panel (press **U** or click the header) contains display toggles and sliders:
+
 - **Geometry** - Show/hide shape outlines and Keystone corners
 - **Mask** - Enable/disable shape masking (clipping to contour)
 - **Cursor** - Show/hide system cursor
 - **Crosshair** - Show/hide cursor crosshair overlay
 - **Grid** - Show/hide background grid
-- **Hints** - Show/hide the hints panel
+- **HitViz** - Show/hide hit area visualization circles
+- **Hit Area** slider - Scale the click detection radius for vertices, edges, and handles
+- **UI Scale** slider - Scale the size of all UI elements
 
 ### File Operations
 
@@ -336,12 +344,10 @@ The right-side panel adapts to your selection:
 
 ## License
 
-This work is licensed under a [Creative Commons Attribution-ShareAlike 4.0 International License](http://creativecommons.org/licenses/by-sa/4.0/).
+As of version 1.1, this software is licensed under the [PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0/). Previous versions remain available under their original terms (Creative Commons BY-SA 4.0).
 
-You are free to:
-- **Share** - copy and redistribute the material
-- **Adapt** - remix, transform, and build upon the material
+This license allows:
+- **Personal use** - Use Hayai for your own non-commercial projects
+- **Research use** - Use Hayai in academic and research settings
 
-Under the following terms:
-- **Attribution** - Give appropriate credit
-- **ShareAlike** - Distribute contributions under the same license
+Commercial use requires a separate agreement. Contact **TheAdamCroston@gmail.com** for commercial licensing options.

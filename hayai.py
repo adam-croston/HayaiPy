@@ -99,6 +99,7 @@ HANDLE_COLOR = (255, 255, 255)           # White grasp handles
 HANDLE_HOVER_COLOR = (255, 220, 100)     # Yellow when hovered
 HANDLE_SIZE = 8                          # Radius for corner handles
 EDGE_HANDLE_SIZE = 6                     # Radius for edge handles
+HIT_RADIUS = 12                          # Base hit detection radius (consistent across all modes)
 GROUP_MEMBER_TINT = (180, 160, 100)      # Dimmer outline for shapes in selected group
 
 # Marching ants animation
@@ -188,13 +189,28 @@ def draw_tooltip_at_cursor(surface, font, text: str, scale: float = 1.0):
     surface.blit(text_surf, (tooltip_x + padding, tooltip_y + padding))
 
 
+@dataclass
+class PanelAnimState:
+    """Animation state for vertically collapsible panels."""
+    collapsed: bool = False
+    animating: bool = False
+    animation_start: float = 0.0
+    animation_duration: float = 0.15
+    animation_progress: float = 1.0
+
+    def toggle(self):
+        """Toggle collapsed/expanded state and start animation."""
+        self.collapsed = not self.collapsed
+        self.animating = True
+        self.animation_start = time.time()
+
+
 def update_panel_animation(panel) -> None:
     """
     Update collapsible panel animation state.
 
-    Shared helper for ScenePanel and ImageryPanel animation.
-    Panel must have: animating, animation_start, animation_duration,
-                     collapsed, animation_progress attributes.
+    Works with PanelAnimState instances and any panel object that has:
+    animating, animation_start, animation_duration, collapsed, animation_progress.
     """
     if not panel.animating:
         return
@@ -2799,13 +2815,15 @@ class Button:
 class Slider:
     """Interactive slider control for numeric values"""
     def __init__(self, x, y, width, height, min_val, max_val, value, label,
-                 on_change=None, format_str="{:.2f}", disabled=False, tooltip=None):
+                 on_change=None, format_str="{:.2f}", disabled=False, tooltip=None,
+                 on_release=None):
         self.rect = pygame.Rect(x, y, width, height)
         self.min_val = min_val
         self.max_val = max_val
         self.value = value
         self.label = label
         self.on_change = on_change
+        self.on_release = on_release
         self.format_str = format_str
         self.dragging = False
         self.track_height = 4
@@ -2864,6 +2882,11 @@ class Slider:
             if self.hovered and not was_hovered:
                 self.hover_start_time = time.time()
             if self.dragging:
+                if not event.buttons[0]:  # Left button released while we weren't looking
+                    self.dragging = False
+                    if self.on_release:
+                        self.on_release(self.value)
+                    return False
                 self._update_value(event.pos[0])
                 return True
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -2876,7 +2899,10 @@ class Slider:
                 self._update_value(event.pos[0])
                 return True
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            was_dragging = self.dragging
             self.dragging = False
+            if was_dragging and self.on_release:
+                self.on_release(self.value)
         return False
 
     def _update_value(self, mouse_x):
@@ -3814,6 +3840,7 @@ class ScenePanel:
                         self.app.select_item(item, force_individual=True)
 
                     return True
+                self.app.clear_selection()
                 return True  # Consume click in panel area
 
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
@@ -4279,7 +4306,7 @@ class ScenePanel:
         if self.chevron_hovered:
             elapsed = time.time() - self.chevron_hover_start
             if elapsed >= TOOLTIP_DELAY:
-                tooltip_text = "Expand scene panel" if self.collapsed else "Collapse scene panel"
+                tooltip_text = "Expand scene panel (S)" if self.collapsed else "Collapse scene panel (S)"
                 draw_tooltip_at_cursor(surface, font, tooltip_text, scale)
 
         if self.search_hovered and not self.collapsed:
@@ -5303,7 +5330,7 @@ class ImageryPanel:
         if self.chevron_hovered:
             elapsed = time.time() - self.chevron_hover_start
             if elapsed >= TOOLTIP_DELAY:
-                tooltip_text = "Expand imagery panel" if self.collapsed else "Collapse imagery panel"
+                tooltip_text = "Expand imagery panel (I)" if self.collapsed else "Collapse imagery panel (I)"
                 draw_tooltip_at_cursor(surface, font, tooltip_text, scale)
 
         # Add button tooltips
@@ -5356,7 +5383,7 @@ class Hayai:
         # Initialize OpenGL renderer
         gl_renderer.init_gl(init_width, init_height)
 
-        pygame.display.set_caption("Hayai : Rapid Projection Mapping")
+        pygame.display.set_caption("Hayai 1.1 : Rapid Projection Mapping")
 
         # Internal resolution
         WIDTH, HEIGHT = init_width, init_height
@@ -5372,7 +5399,25 @@ class Hayai:
         self.show_crosshair = True  # Crosshair toggle (on by default)
         self.show_cursor = True  # System cursor visibility
         self.show_grid = True  # Background grid (on by default)
-        self.show_hints = True  # Hints panel visibility (on by default)
+        self.hit_area_scale = 1.0  # Scale factor for hit detection radii
+        self.show_hit_areas = True  # Show hit area visualization circles
+        self.display_panel_anim = PanelAnimState(collapsed=True, animation_progress=0.0)
+        self.properties_panel_anim = PanelAnimState(collapsed=False, animation_progress=1.0)
+        self.tools_panel_anim = PanelAnimState(collapsed=False, animation_progress=1.0)
+        self.hints_panel_anim = PanelAnimState(collapsed=False, animation_progress=1.0)
+        self.display_panel_buttons = []  # Buttons in the display panel
+        self.tools_panel_buttons = []  # Buttons in the tools panel
+        self._display_header_rect = pygame.Rect(0, 0, 0, 0)
+        self._properties_header_rect = pygame.Rect(0, 0, 0, 0)
+        self._tools_header_rect = pygame.Rect(0, 0, 0, 0)
+        self._hints_header_rect = pygame.Rect(0, 0, 0, 0)
+        # Header tooltip hover tracking: {name: (is_hovered, hover_start_time)}
+        self._header_hover = {
+            'display': (False, 0.0),
+            'properties': (False, 0.0),
+            'tools': (False, 0.0),
+            'hints': (False, 0.0),
+        }
         self.mouse_pos = (0, 0)  # Track mouse position for shape preview
 
         # Shape placement mode
@@ -5472,8 +5517,9 @@ class Hayai:
         # Create properties panel
         self.create_properties_panel()
 
-        # Create UI scale slider
+        # Create UI panel sliders
         self.create_scale_slider()
+        self.create_hit_area_slider()
 
         # Create hierarchy panel, imagery panel, and context menu
         self.hierarchy_panel = ScenePanel(self)
@@ -5495,24 +5541,46 @@ class Hayai:
         self.font_small = pygame.font.Font(None, int(base_font_small_size * self.ui_scale))
 
     def create_scale_slider(self):
-        """Create the UI scale slider in DISPLAY group (lower-left)"""
-        slider_width = int(100 * self.ui_scale)  # Match button width
+        """Create the UI scale slider in UI panel (repositioned per frame)"""
+        slider_width = int(110 * self.ui_scale)
         slider_height = int(35 * self.ui_scale)
-        # Use position calculated in create_ui()
-        x = getattr(self, 'display_slider_x', 15)
-        y = getattr(self, 'display_slider_y', HEIGHT - slider_height - 15)
         self.ui_scale_slider = Slider(
-            x, y,
-            slider_width, slider_height,
+            0, 0, slider_width, slider_height,
             0.1, 5.0, self.ui_scale,
-            "UI Scale", self.on_ui_scale_change, "{:.1f}x",
+            "UI Scale", format_str="{:.1f}x",
+            on_release=self.on_ui_scale_change,
             tooltip="Change the size of all UI elements"
         )
+        offsets = getattr(self, '_dp_slider_offsets', {}).get('ui_scale')
+        if offsets:
+            self.ui_scale_slider._panel_offset_x, self.ui_scale_slider._panel_offset_y = offsets
 
     def on_ui_scale_change(self, value):
         """Callback when UI scale slider is changed"""
         self.ui_scale = value
         self.recreate_ui_elements()
+
+    def create_hit_area_slider(self):
+        """Create the hit area scale slider in UI panel (repositioned per frame)"""
+        slider_width = int(110 * self.ui_scale)
+        slider_height = int(35 * self.ui_scale)
+        self.hit_area_slider = Slider(
+            0, 0, slider_width, slider_height,
+            0.5, 5.0, self.hit_area_scale,
+            "Hit Area", self.on_hit_area_change, "{:.1f}x",
+            tooltip="Scale hit detection radius for vertices, edges, and handles"
+        )
+        offsets = getattr(self, '_dp_slider_offsets', {}).get('hit_area')
+        if offsets:
+            self.hit_area_slider._panel_offset_x, self.hit_area_slider._panel_offset_y = offsets
+
+    def on_hit_area_change(self, value):
+        """Callback when hit area scale slider is changed"""
+        self.hit_area_scale = value
+
+    def _hit_radius(self) -> float:
+        """Compute the effective hit detection radius (HIT_RADIUS scaled by user preference)."""
+        return HIT_RADIUS * self.hit_area_scale
 
     def recreate_ui_elements(self):
         """Recreate all UI elements with current scale"""
@@ -5520,7 +5588,29 @@ class Hayai:
         self.create_ui()
         self.create_properties_panel()
         self.create_scale_slider()  # Recreate at new position/size
-        self.update_mode_button_states()  # Restore button states
+        self.create_hit_area_slider()
+        # Restore all button states from current mode
+        self._restore_mode_button_states()
+        self.sync_all_display_toggles()
+        self.update_mode_button_states()
+
+    def _restore_mode_button_states(self):
+        """Restore mode button active states from current mode after UI recreation."""
+        if self.mode == self.MODE_MAKE_SHAPE:
+            if self.pending_shape_type == "regular":
+                self.btn_create_regular.active = True
+                self.sides_entry.disabled = False
+                self.btn_on_corner.disabled = False
+            else:
+                self.btn_create_freeform.active = True
+        elif self.mode == self.MODE_MOVE_SHAPE:
+            self.btn_move_shape.active = True
+        elif self.mode == self.MODE_EDIT_SHAPE:
+            self.btn_edit_shape.active = True
+            self.btn_flip_x.disabled = False
+            self.btn_flip_y.disabled = False
+        elif self.mode == self.MODE_EDIT_WARP:
+            self.btn_edit_warp.active = True
 
     def generate_shape_name(self):
         """Generate a unique name for a new shape"""
@@ -6203,9 +6293,10 @@ class Hayai:
         self.buttons = []
 
         # ===== TOOLS PANEL (CENTER TOP) =====
-        tools_panel_width = int(385 * self.ui_scale)
-        tools_panel_x = (WIDTH - tools_panel_width) // 2
+        self.tools_panel_width = int(385 * self.ui_scale)
+        tools_panel_x = (WIDTH - self.tools_panel_width) // 2
         tools_panel_y = self.panel_margin_v
+        self.tools_header_height = int(28 * self.ui_scale)
         subtitle_height = int(18 * self.ui_scale)  # Height for section subtitles
 
         # Row 1: Shape creation buttons (below panel header + "Create" subtitle)
@@ -6215,19 +6306,23 @@ class Hayai:
 
         create_total_width = create_btn_w * 2 + slider_w + corner_btn_w + gap * 3
         create_x = (WIDTH - create_total_width) // 2
-        # Store subtitle Y position for drawing
-        self.tools_create_subtitle_y = tools_panel_y + panel_header_height
-        create_y = self.tools_create_subtitle_y + subtitle_height
+        # Store subtitle Y offset relative to tools panel top
+        self._tp_create_subtitle_offset_y = panel_header_height
+        create_y = tools_panel_y + panel_header_height + subtitle_height
 
         self.btn_create_freeform = Button(create_x, create_y, create_btn_w, btn_h, "Freeform",
                                           self.start_poly_mode,
                                           tooltip="Draw custom polygon")
+        self.btn_create_freeform._panel_offset_x = self.btn_create_freeform.rect.x - tools_panel_x
+        self.btn_create_freeform._panel_offset_y = self.btn_create_freeform.rect.y - tools_panel_y
         self.buttons.append(self.btn_create_freeform)
 
         create_x += create_btn_w + gap
         self.btn_create_regular = Button(create_x, create_y, create_btn_w, btn_h, "Regular",
                                          self.start_regular_placement,
                                          tooltip="Place regular polygon")
+        self.btn_create_regular._panel_offset_x = self.btn_create_regular.rect.x - tools_panel_x
+        self.btn_create_regular._panel_offset_y = self.btn_create_regular.rect.y - tools_panel_y
         self.buttons.append(self.btn_create_regular)
 
         create_x += create_btn_w + gap
@@ -6237,12 +6332,16 @@ class Hayai:
                                         3, 120, self.regular_polygon_sides,
                                         "Sides", self.on_sides_change,
                                         tooltip="Number of regular polygon sides")
+        self.sides_entry._panel_offset_x = self.sides_entry.rect.x - tools_panel_x
+        self.sides_entry._panel_offset_y = self.sides_entry.rect.y - tools_panel_y
 
         create_x += slider_w + gap
         self.btn_on_corner = Button(create_x, create_y, corner_btn_w, btn_h,
                                     "Corner: ON" if self.on_corner else "Corner: OFF",
                                     self.toggle_on_corner,
                                     tooltip="Toggle vertex vs edge at bottom")
+        self.btn_on_corner._panel_offset_x = self.btn_on_corner.rect.x - tools_panel_x
+        self.btn_on_corner._panel_offset_y = self.btn_on_corner.rect.y - tools_panel_y
         self.buttons.append(self.btn_on_corner)
 
         # Sides entry and corner button disabled until Regular mode is selected
@@ -6254,15 +6353,17 @@ class Hayai:
         mode_btn_count = 3
         mode_total_width = mode_btn_count * btn_w + (mode_btn_count - 1) * gap
         mode_x = (WIDTH - mode_total_width) // 2
-        # Store subtitle Y position for drawing (with section_gap before it)
-        self.tools_edit_subtitle_y = create_y + btn_h + gap + self.section_gap
-        mode_y = self.tools_edit_subtitle_y + subtitle_height
+        # Store subtitle Y offset relative to tools panel top (with section_gap before it)
+        self._tp_edit_subtitle_offset_y = (panel_header_height + subtitle_height + btn_h + gap + self.section_gap)
+        mode_y = tools_panel_y + self._tp_edit_subtitle_offset_y + subtitle_height
 
         # Position 1: Modify Shape (formerly Edit Shape)
         modify_shape_x = mode_x
         self.btn_edit_shape = Button(mode_x, mode_y, btn_w, btn_h, "Modify Shape",
                                      lambda: self.set_mode(self.MODE_EDIT_SHAPE),
                                      tooltip="Add, move, or delete polygon vertices")
+        self.btn_edit_shape._panel_offset_x = self.btn_edit_shape.rect.x - tools_panel_x
+        self.btn_edit_shape._panel_offset_y = self.btn_edit_shape.rect.y - tools_panel_y
         self.buttons.append(self.btn_edit_shape)
 
         mode_x += btn_w + gap
@@ -6271,6 +6372,8 @@ class Hayai:
         self.btn_move_shape = Button(mode_x, mode_y, btn_w, btn_h, "Move Shape",
                                      lambda: self.set_mode(self.MODE_MOVE_SHAPE),
                                      tooltip="Move and rotate shapes")
+        self.btn_move_shape._panel_offset_x = self.btn_move_shape.rect.x - tools_panel_x
+        self.btn_move_shape._panel_offset_y = self.btn_move_shape.rect.y - tools_panel_y
         self.buttons.append(self.btn_move_shape)
 
         mode_x += btn_w + gap
@@ -6279,6 +6382,8 @@ class Hayai:
         self.btn_edit_warp = Button(mode_x, mode_y, btn_w, btn_h, "Edit Keystone",
                                     lambda: self.set_mode(self.MODE_EDIT_WARP),
                                     tooltip="Adjust perspective and visual properties")
+        self.btn_edit_warp._panel_offset_x = self.btn_edit_warp.rect.x - tools_panel_x
+        self.btn_edit_warp._panel_offset_y = self.btn_edit_warp.rect.y - tools_panel_y
         self.buttons.append(self.btn_edit_warp)
 
         # ===== SUB-BUTTONS UNDER MODE BUTTONS =====
@@ -6289,137 +6394,190 @@ class Hayai:
         self.btn_flip_x = Button(modify_shape_x, sub_btn_y, half_w, btn_h, "FlipX", self.flip_x,
                                  tooltip="Flip Horizontal")
         self.btn_flip_x.disabled = True  # Initially disabled
+        self.btn_flip_x._panel_offset_x = self.btn_flip_x.rect.x - tools_panel_x
+        self.btn_flip_x._panel_offset_y = self.btn_flip_x.rect.y - tools_panel_y
         self.buttons.append(self.btn_flip_x)
         self.btn_flip_y = Button(modify_shape_x + half_w + gap, sub_btn_y, half_w, btn_h, "FlipY", self.flip_y,
                                  tooltip="Flip Vertical")
         self.btn_flip_y.disabled = True
+        self.btn_flip_y._panel_offset_x = self.btn_flip_y.rect.x - tools_panel_x
+        self.btn_flip_y._panel_offset_y = self.btn_flip_y.rect.y - tools_panel_y
         self.buttons.append(self.btn_flip_y)
 
-        # ===== DISPLAY PANEL (LEFT SIDE, BOTTOM) =====
-        display_panel_width = int(120 * self.ui_scale)
-        display_panel_height = int(285 * self.ui_scale)  # 6 buttons + slider + padding
-        display_panel_x = margin + int(ScenePanel.COLLAPSED_WIDTH * self.ui_scale)
-        display_panel_y = HEIGHT - self.panel_margin_v - display_panel_height
-        display_btn_x = display_panel_x + panel_padding
-        display_btn_y = display_panel_y + panel_header_height
+        # Collect tools panel buttons and compute content height
+        self.tools_panel_buttons = [
+            self.btn_create_freeform, self.btn_create_regular,
+            self.btn_on_corner, self.btn_edit_shape,
+            self.btn_move_shape, self.btn_edit_warp,
+            self.btn_flip_x, self.btn_flip_y
+        ]
+        tools_panel_height = int(179 * self.ui_scale)
+        self.tools_content_height = tools_panel_height - self.tools_header_height
 
-        # Geometry toggle
-        self.btn_geometry_toggle = Button(display_btn_x, display_btn_y, btn_w, btn_h,
+        # ===== UI PANEL (LEFT SIDE, TOP - anchored to Scene panel) =====
+        self.display_panel_width = int(130 * self.ui_scale)
+        self.display_header_height = int(28 * self.ui_scale)
+        # Relative offsets from panel top-left for button content area
+        dp_content_x = panel_padding  # Relative x offset for buttons inside panel
+        dp_content_y = self.display_header_height  # First button y relative to panel top
+        dp_row_step = btn_h + gap
+
+        # Create buttons at temporary positions (will be repositioned each frame)
+        self.btn_geometry_toggle = Button(0, 0, btn_w, btn_h,
                                        "Geom: ON" if self.show_geom else "Geom: OFF",
                                        self.toggle_geometry, tooltip="Toggle geometry display")
         self.btn_geometry_toggle.active = not self.show_geom
+        self.btn_geometry_toggle._panel_offset_x = dp_content_x
+        self.btn_geometry_toggle._panel_offset_y = dp_content_y
         self.buttons.append(self.btn_geometry_toggle)
 
-        display_btn_y += btn_h + gap
-        # Mask toggle
-        self.btn_mask_toggle = Button(display_btn_x, display_btn_y, btn_w, btn_h,
+        self.btn_mask_toggle = Button(0, 0, btn_w, btn_h,
                                       "Mask: ON" if self.show_mask else "Mask: OFF",
                                       self.toggle_mask, tooltip="Toggle shape masking")
         self.btn_mask_toggle.active = not self.show_mask
+        self.btn_mask_toggle._panel_offset_x = dp_content_x
+        self.btn_mask_toggle._panel_offset_y = dp_content_y + dp_row_step
         self.buttons.append(self.btn_mask_toggle)
 
-        display_btn_y += btn_h + gap
-        # Cursor toggle
-        self.btn_cursor_toggle = Button(display_btn_x, display_btn_y, btn_w, btn_h,
+        self.btn_cursor_toggle = Button(0, 0, btn_w, btn_h,
                                         "Cursor: ON" if self.show_cursor else "Cursor: OFF",
                                         self.toggle_cursor, tooltip="Toggle system cursor visibility")
         self.btn_cursor_toggle.active = not self.show_cursor
+        self.btn_cursor_toggle._panel_offset_x = dp_content_x
+        self.btn_cursor_toggle._panel_offset_y = dp_content_y + dp_row_step * 2
         self.buttons.append(self.btn_cursor_toggle)
 
-        display_btn_y += btn_h + gap
-        # Crosshair toggle
-        self.btn_crosshair_toggle = Button(display_btn_x, display_btn_y, btn_w, btn_h,
+        self.btn_crosshair_toggle = Button(0, 0, btn_w, btn_h,
                                            "Cross: ON" if self.show_crosshair else "Cross: OFF",
                                            self.toggle_crosshair, tooltip="Toggle cursor crosshair")
         self.btn_crosshair_toggle.active = not self.show_crosshair
+        self.btn_crosshair_toggle._panel_offset_x = dp_content_x
+        self.btn_crosshair_toggle._panel_offset_y = dp_content_y + dp_row_step * 3
         self.buttons.append(self.btn_crosshair_toggle)
 
-        display_btn_y += btn_h + gap
-        # Grid toggle
-        self.btn_grid_toggle = Button(display_btn_x, display_btn_y, btn_w, btn_h,
+        self.btn_grid_toggle = Button(0, 0, btn_w, btn_h,
                                       "Grid: ON" if self.show_grid else "Grid: OFF",
                                       self.toggle_grid, tooltip="Toggle background grid")
         self.btn_grid_toggle.active = not self.show_grid
+        self.btn_grid_toggle._panel_offset_x = dp_content_x
+        self.btn_grid_toggle._panel_offset_y = dp_content_y + dp_row_step * 4
         self.buttons.append(self.btn_grid_toggle)
 
-        display_btn_y += btn_h + gap
-        # Hints toggle
-        self.btn_hints_toggle = Button(display_btn_x, display_btn_y, btn_w, btn_h,
-                                       "Hints: ON" if self.show_hints else "Hints: OFF",
-                                       self.toggle_hints, tooltip="Toggle hints panel")
-        self.btn_hints_toggle.active = not self.show_hints
-        self.buttons.append(self.btn_hints_toggle)
+        self.btn_hit_area_viz = Button(0, 0, btn_w, btn_h,
+                                       "HitViz: ON" if self.show_hit_areas else "HitViz: OFF",
+                                       self.toggle_hit_area_viz, tooltip="Show hit detection areas")
+        self.btn_hit_area_viz.active = not self.show_hit_areas
+        self.btn_hit_area_viz._panel_offset_x = dp_content_x
+        self.btn_hit_area_viz._panel_offset_y = dp_content_y + dp_row_step * 5
+        self.buttons.append(self.btn_hit_area_viz)
 
-        # UI Scale slider position (will be created in create_scale_slider)
-        self.display_slider_y = display_btn_y + btn_h + int(12 * self.ui_scale)
-        self.display_slider_x = display_btn_x
+        # Collect display panel buttons for per-frame repositioning
+        self.display_panel_buttons = [
+            self.btn_geometry_toggle, self.btn_mask_toggle,
+            self.btn_cursor_toggle, self.btn_crosshair_toggle,
+            self.btn_grid_toggle, self.btn_hit_area_viz
+        ]
+
+        # Slider relative offsets within display panel (stored on slider objects)
+        slider_height = int(35 * self.ui_scale)
+        gap_before_sliders = int(4 * self.ui_scale)
+        slider_gap = int(4 * self.ui_scale)
+
+        hit_area_slider_offset_y = dp_content_y + dp_row_step * 6 + gap_before_sliders
+        ui_scale_slider_offset_y = hit_area_slider_offset_y + slider_height + slider_gap
+
+        # Offsets will be applied to slider objects once they are created (in create_hit_area_slider / create_scale_slider)
+        self._dp_slider_offsets = {
+            'hit_area': (dp_content_x, hit_area_slider_offset_y),
+            'ui_scale': (dp_content_x, ui_scale_slider_offset_y),
+        }
+
+        # Total content height (6 buttons + gap + 2 sliders + gap + padding)
+        self.display_content_height = (dp_row_step * 6 + gap_before_sliders +
+                                       slider_height * 2 + slider_gap + int(8 * self.ui_scale))
 
     def create_properties_panel(self):
-        """Create properties panel controls on right side"""
+        """Create properties panel controls on right side (with relative offsets for per-frame repositioning)"""
         # Scale dimensions
         panel_width = int(220 * self.ui_scale)
-        panel_x = WIDTH - panel_width - self.panel_margin
-        panel_y = self.panel_margin_v
         slider_width = int(180 * self.ui_scale)
         slider_height = int(35 * self.ui_scale)
         input_height = int(24 * self.ui_scale)
         padding = int(10 * self.ui_scale)
         row_spacing = int(38 * self.ui_scale)  # Consistent spacing between rows
+        self.properties_header_height = int(28 * self.ui_scale)
 
+        # All y_offsets are relative to panel top
         # Name input (with label above, so position accounts for label space)
-        # Panel header is 28px, then label needs 18px above input
-        y_offset = panel_y + int(48 * self.ui_scale)
-        self.name_input = TextInput(panel_x + padding, y_offset,
-                                    slider_width, input_height,
+        y_rel = int(48 * self.ui_scale)
+        self.name_input = TextInput(0, 0, slider_width, input_height,
                                     label="Name", on_change=self.on_name_change)
+        self.name_input._panel_offset_x = padding
+        self.name_input._panel_offset_y = y_rel
 
         # ===== IMAGERY SOURCE SECTION =====
-        y_offset += row_spacing + self.section_gap
-        self.source_section_y = y_offset  # Store for drawing section header
-        y_offset += int(20 * self.ui_scale)  # Space for section header
+        y_rel += row_spacing + self.section_gap
+        self._pp_source_section_offset_y = y_rel  # Relative offset for section header
+        y_rel += int(20 * self.ui_scale)  # Space for section header
 
         # Frame offset slider (for animation sync)
-        self.frame_offset_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
+        self.frame_offset_slider = Slider(0, 0, slider_width, slider_height,
                                           0.0, 100.0, 0.0, "Frame Offset %", self.on_frame_offset_change, "{:.0f}%",
                                           tooltip="Offset animation timing for sync effects")
         self.frame_offset_slider.disabled = True
+        self.frame_offset_slider._panel_offset_x = padding
+        self.frame_offset_slider._panel_offset_y = y_rel
 
         # Alpha slider
-        y_offset += row_spacing
-        self.alpha_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
+        y_rel += row_spacing
+        self.alpha_slider = Slider(0, 0, slider_width, slider_height,
                                    0.0, 1.0, 1.0, "Alpha", self.on_alpha_slider_change)
+        self.alpha_slider._panel_offset_x = padding
+        self.alpha_slider._panel_offset_y = y_rel
 
-        y_offset += row_spacing
-        self.hue_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
+        y_rel += row_spacing
+        self.hue_slider = Slider(0, 0, slider_width, slider_height,
                                  0.0, 360.0, 0.0, "Hue", self.on_hue_change, "{:.0f}")
+        self.hue_slider._panel_offset_x = padding
+        self.hue_slider._panel_offset_y = y_rel
 
-        y_offset += row_spacing
-        self.sat_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
+        y_rel += row_spacing
+        self.sat_slider = Slider(0, 0, slider_width, slider_height,
                                  0.0, 2.0, 1.0, "Saturation", self.on_sat_change)
+        self.sat_slider._panel_offset_x = padding
+        self.sat_slider._panel_offset_y = y_rel
 
-        y_offset += row_spacing
-        self.val_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
+        y_rel += row_spacing
+        self.val_slider = Slider(0, 0, slider_width, slider_height,
                                  0.0, 2.0, 1.0, "Brightness", self.on_val_change)
+        self.val_slider._panel_offset_x = padding
+        self.val_slider._panel_offset_y = y_rel
 
         # ===== KEYSTONE SECTION =====
-        y_offset += row_spacing + self.section_gap
-        self.keystone_section_y = y_offset  # Store for drawing section header
-        y_offset += int(20 * self.ui_scale)  # Space for section header
+        y_rel += row_spacing + self.section_gap
+        self._pp_keystone_section_offset_y = y_rel  # Relative offset for section header
+        y_rel += int(20 * self.ui_scale)  # Space for section header
 
         # Fit To Shape button in properties panel (not in main buttons list - handled separately)
         btn_h = int(28 * self.ui_scale)
-        self.btn_fit_warp = Button(panel_x + padding, y_offset, slider_width, btn_h,
+        self.btn_fit_warp = Button(0, 0, slider_width, btn_h,
                                    "Fit To Shape", self.fit_warp,
                                    tooltip="Reset warp corners to shape bounds")
         self.btn_fit_warp.disabled = True
+        self.btn_fit_warp._panel_offset_x = padding
+        self.btn_fit_warp._panel_offset_y = y_rel
 
-        y_offset += btn_h + int(8 * self.ui_scale)
-        self.persp_x_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
+        y_rel += btn_h + int(8 * self.ui_scale)
+        self.persp_x_slider = Slider(0, 0, slider_width, slider_height,
                                      -1.0, 1.0, 0.0, "Perspective X", self.on_persp_x_change)
+        self.persp_x_slider._panel_offset_x = padding
+        self.persp_x_slider._panel_offset_y = y_rel
 
-        y_offset += row_spacing
-        self.persp_y_slider = Slider(panel_x + padding, y_offset, slider_width, slider_height,
+        y_rel += row_spacing
+        self.persp_y_slider = Slider(0, 0, slider_width, slider_height,
                                      -1.0, 1.0, 0.0, "Perspective Y", self.on_persp_y_change)
+        self.persp_y_slider._panel_offset_x = padding
+        self.persp_y_slider._panel_offset_y = y_rel
 
         self.properties_sliders = [self.frame_offset_slider,
                                    self.alpha_slider, self.hue_slider,
@@ -6427,10 +6585,10 @@ class Hayai:
                                    self.persp_x_slider, self.persp_y_slider]
 
         # Store panel dimensions for drawing
-        self.properties_panel_x = panel_x
-        self.properties_panel_y = panel_y
         self.properties_panel_width = panel_width
         self.properties_panel_padding = padding
+        # Total content height for shape properties (header excluded)
+        self.properties_content_height = y_rel + row_spacing
 
     def on_name_change(self, new_name):
         """Callback when shape or group name is changed"""
@@ -6635,7 +6793,7 @@ class Hayai:
         self._sync_display_toggle_button(self.btn_crosshair_toggle, "Cross", self.show_crosshair)
         self._sync_display_toggle_button(self.btn_cursor_toggle, "Cursor", self.show_cursor)
         self._sync_display_toggle_button(self.btn_grid_toggle, "Grid", self.show_grid)
-        self._sync_display_toggle_button(self.btn_hints_toggle, "Hints", self.show_hints)
+        self._sync_display_toggle_button(self.btn_hit_area_viz, "HitViz", self.show_hit_areas)
 
     def _toggle_display(self, attr: str, button, label: str):
         """Toggle a display boolean and sync its button state."""
@@ -6658,8 +6816,20 @@ class Hayai:
     def toggle_grid(self):
         self._toggle_display('show_grid', self.btn_grid_toggle, "Grid")
 
-    def toggle_hints(self):
-        self._toggle_display('show_hints', self.btn_hints_toggle, "Hints")
+    def toggle_hit_area_viz(self):
+        self._toggle_display('show_hit_areas', self.btn_hit_area_viz, "HitViz")
+
+    def toggle_hints_panel(self):
+        self.hints_panel_anim.toggle()
+
+    def toggle_tools_panel(self):
+        self.tools_panel_anim.toggle()
+
+    def toggle_display_panel(self):
+        self.display_panel_anim.toggle()
+
+    def toggle_properties_panel(self):
+        self.properties_panel_anim.toggle()
 
     def toggle_play_mode(self):
         self.play_mode = not self.play_mode
@@ -7148,7 +7318,7 @@ class Hayai:
         # Use world scale for hit detection threshold
         world_scale = self.selected_shape._get_world_scale()
         for i, wp in enumerate(self.selected_shape.warp_points):
-            if math.dist(local_pos, wp) < 15 / world_scale:
+            if math.dist(local_pos, wp) < self._hit_radius() / world_scale:
                 return i
         return None
 
@@ -7161,7 +7331,7 @@ class Hayai:
         # Use world scale for hit detection threshold
         world_scale = self.selected_shape._get_world_scale()
         for i, v in enumerate(self.selected_shape.contour):
-            if math.dist(local_pos, v) < 12 / world_scale:
+            if math.dist(local_pos, v) < self._hit_radius() / world_scale:
                 return i
         return None
 
@@ -7170,12 +7340,11 @@ class Hayai:
         if not self.selected_shape or len(self.selected_shape.contour) < 2:
             return None
 
-        # Convert world pos to local coords
         local_pos = self.selected_shape.get_local_point(pos[0], pos[1])
         contour = self.selected_shape.contour
         n = len(contour)
-        # Use world scale for hit detection threshold
         world_scale = self.selected_shape._get_world_scale()
+        threshold = self._hit_radius() / world_scale
 
         for i in range(n):
             p1 = contour[i]
@@ -7192,11 +7361,10 @@ class Hayai:
                 t = max(0, min(1, ((local_pos[0] - p1[0]) * dx + (local_pos[1] - p1[1]) * dy) / length_sq))
                 closest = (p1[0] + t * dx, p1[1] + t * dy)
 
-            dist = math.dist(local_pos, closest)
-            if dist < 10 / world_scale:
-                # Make sure we're not too close to the vertices (those take priority)
-                if math.dist(local_pos, p1) > 12 / world_scale and math.dist(local_pos, p2) > 12 / world_scale:
-                    return (i, closest)  # Returns local coords
+            if math.dist(local_pos, closest) < threshold:
+                # Vertices take priority -- skip edges too close to endpoints
+                if math.dist(local_pos, p1) > threshold and math.dist(local_pos, p2) > threshold:
+                    return (i, closest)
 
         return None
 
@@ -7495,13 +7663,13 @@ class Hayai:
         # Check corner handles first (larger hit area)
         for handle_id in ('tl', 'tr', 'bl', 'br'):
             hx, hy = handles[handle_id]
-            if math.dist(pos, (hx, hy)) <= HANDLE_SIZE + 2:
+            if math.dist(pos, (hx, hy)) <= self._hit_radius():
                 return handle_id
 
         # Check edge handles
         for handle_id in ('t', 'b', 'l', 'r'):
             hx, hy = handles[handle_id]
-            if math.dist(pos, (hx, hy)) <= EDGE_HANDLE_SIZE + 2:
+            if math.dist(pos, (hx, hy)) <= self._hit_radius():
                 return handle_id
 
         return None
@@ -7544,6 +7712,81 @@ class Hayai:
             pygame.draw.circle(self.ui_surface, color, (cx, cy), EDGE_HANDLE_SIZE)
             pygame.draw.circle(self.ui_surface, (0, 0, 0), (cx, cy), EDGE_HANDLE_SIZE, 1)
 
+    def draw_hit_area_visualization(self):
+        """Draw semi-transparent circles showing hit detection radii for interactive elements."""
+        mouse_pos = pygame.mouse.get_pos()
+        mouse_world = self.unscale_point(mouse_pos[0], mouse_pos[1])
+        win_sx, win_sy = self.get_scale()
+        avg_scale = (win_sx + win_sy) / 2
+
+        def draw_viz_circle(sx, sy, screen_radius, inside):
+            sr = max(3, int(screen_radius))
+            if inside:
+                viz_surf = pygame.Surface((sr * 2, sr * 2), pygame.SRCALPHA)
+                pygame.draw.circle(viz_surf, (255, 255, 100, 120), (sr, sr), sr)
+                self.ui_surface.blit(viz_surf, (sx - sr, sy - sr))
+            else:
+                pygame.draw.circle(self.ui_surface, (255, 255, 255, 40), (sx, sy), sr, 1)
+
+        # Edit Shape and Edit Warp share the same visualization logic over shape-local points
+        if self.mode in (self.MODE_EDIT_SHAPE, self.MODE_EDIT_WARP) and self.selected_shape:
+            shape = self.selected_shape
+            points = shape.contour if self.mode == self.MODE_EDIT_SHAPE else shape.warp_points
+            world_scale = shape._get_world_scale()
+            radius_local = self._hit_radius() / world_scale
+            screen_radius = radius_local * world_scale * avg_scale
+            local_mouse = shape.get_local_point(mouse_world[0], mouse_world[1])
+            for pt in points:
+                wx, wy = shape.get_world_point(pt[0], pt[1])
+                sx, sy = self.scale_point(wx, wy)
+                inside = math.dist(local_mouse, pt) < radius_local
+                draw_viz_circle(int(sx), int(sy), screen_radius, inside)
+
+        elif self.mode == self.MODE_MOVE_SHAPE and self.selected_items:
+            bounds = self.get_selection_bounds()
+            if bounds:
+                min_x, min_y, max_x, max_y = bounds
+                mid_x, mid_y = (min_x + max_x) / 2, (min_y + max_y) / 2
+                all_handles = [
+                    (min_x, min_y), (max_x, min_y), (min_x, max_y), (max_x, max_y),
+                    (mid_x, min_y), (mid_x, max_y), (min_x, mid_y), (max_x, mid_y),
+                ]
+                hit_radius = self._hit_radius()
+                for hx, hy in all_handles:
+                    sx, sy = self.scale_point(hx, hy)
+                    inside = math.dist(mouse_world, (hx, hy)) <= hit_radius
+                    draw_viz_circle(int(sx), int(sy), hit_radius, inside)
+
+    def _reposition_panel_widgets(self, widgets, panel_x, panel_y, anim_progress, animated_h):
+        """Reposition widgets within a collapsible panel based on animation state.
+
+        Each widget must have _panel_offset_x and _panel_offset_y attributes.
+        Sets widget.visible based on whether it fits within the animated panel height.
+        """
+        is_open = anim_progress > 0.05
+        for widget in widgets:
+            if is_open:
+                widget_y = panel_y + widget._panel_offset_y
+                if widget_y + widget.rect.height <= panel_y + animated_h:
+                    widget.rect.x = panel_x + widget._panel_offset_x
+                    widget.rect.y = widget_y
+                    widget.visible = True
+                else:
+                    widget.visible = False
+            else:
+                widget.visible = False
+
+    def _draw_panel_chevron(self, panel_x, panel_y, panel_width, anim_state, upward_when_open=True):
+        """Draw a collapse/expand chevron in a panel header. Returns the header rect."""
+        chevron_x = panel_x + panel_width - int(18 * self.ui_scale)
+        chevron_y = panel_y + int(10 * self.ui_scale)
+        if upward_when_open:
+            chevron_text = "^" if not anim_state.collapsed else "v"
+        else:
+            chevron_text = "v" if not anim_state.collapsed else "^"
+        chevron_surf = self.font_small.render(chevron_text, True, (120, 120, 130))
+        self.ui_surface.blit(chevron_surf, (chevron_x, chevron_y))
+
     def draw_ui(self):
         # Always draw toasts even when UI is hidden
         self.draw_toasts()
@@ -7580,33 +7823,68 @@ class Hayai:
             header = self.font_small.render(title, True, (120, 120, 130))
             self.ui_surface.blit(header, (x + padding, y + int(8 * self.ui_scale)))
 
-        # TOOLS panel (center top) - includes subtitles, creation row, mode buttons, sub-buttons
-        tools_panel_width = int(385 * self.ui_scale)
-        tools_panel_height = int(179 * self.ui_scale)
-        tools_panel_x = (WIDTH - tools_panel_width) // 2
+        # TOOLS panel (center top) - vertically collapsible
+        update_panel_animation(self.tools_panel_anim)
+        tp_anim = self.tools_panel_anim.animation_progress
+        tools_panel_x = (WIDTH - self.tools_panel_width) // 2
         tools_panel_y = self.panel_margin_v
-        draw_panel(tools_panel_x, tools_panel_y, tools_panel_width, tools_panel_height, "TOOLS")
+        tp_header_h = self.tools_header_height
+        tp_animated_h = tp_header_h + int(self.tools_content_height * tp_anim)
+        draw_panel(tools_panel_x, tools_panel_y, self.tools_panel_width, tp_animated_h, "TOOLS")
+        self._draw_panel_chevron(tools_panel_x, tools_panel_y, self.tools_panel_width, self.tools_panel_anim)
+        self._tools_header_rect = pygame.Rect(tools_panel_x, tools_panel_y,
+                                               self.tools_panel_width, tp_header_h)
 
-        # Draw section subtitles in Tools panel
-        subtitle_color = (150, 150, 160)
-        create_subtitle = self.font_small.render("Create", True, subtitle_color)
-        self.ui_surface.blit(create_subtitle, (tools_panel_x + padding, self.tools_create_subtitle_y))
-        edit_subtitle = self.font_small.render("Edit", True, subtitle_color)
-        self.ui_surface.blit(edit_subtitle, (tools_panel_x + padding, self.tools_edit_subtitle_y))
+        # Reposition tools panel buttons and sides entry
+        self._reposition_panel_widgets(self.tools_panel_buttons,
+                                       tools_panel_x, tools_panel_y, tp_anim, tp_animated_h)
+        if self.sides_entry:
+            self._reposition_panel_widgets([self.sides_entry],
+                                           tools_panel_x, tools_panel_y, tp_anim, tp_animated_h)
+            self._tools_sides_entry_visible = getattr(self.sides_entry, 'visible', False)
 
-        # DISPLAY panel (left side, bottom) - 6 buttons + slider
-        display_panel_width = int(120 * self.ui_scale)
-        display_panel_height = int(285 * self.ui_scale)
-        display_panel_x = base_margin + hierarchy_offset
-        display_panel_y = HEIGHT - self.panel_margin_v - display_panel_height
-        draw_panel(display_panel_x, display_panel_y, display_panel_width, display_panel_height, "DISPLAY")
+        # Draw section subtitles in Tools panel (only when content is visible)
+        if tp_anim > 0.05:
+            subtitle_color = (150, 150, 160)
+            panel_bottom = tools_panel_y + tp_animated_h
+            subtitle_h = int(18 * self.ui_scale)
+            create_sub_y = tools_panel_y + self._tp_create_subtitle_offset_y
+            if create_sub_y + subtitle_h <= panel_bottom:
+                self.ui_surface.blit(self.font_small.render("Create", True, subtitle_color),
+                                     (tools_panel_x + padding, create_sub_y))
+            edit_sub_y = tools_panel_y + self._tp_edit_subtitle_offset_y
+            if edit_sub_y + subtitle_h <= panel_bottom:
+                self.ui_surface.blit(self.font_small.render("Edit", True, subtitle_color),
+                                     (tools_panel_x + padding, edit_sub_y))
 
-        # Draw buttons
+        # DISPLAY panel (left side, top - anchored to Scene panel right edge)
+        update_panel_animation(self.display_panel_anim)
+        dp_anim = self.display_panel_anim.animation_progress
+        display_panel_x = self.hierarchy_panel.get_rect().width + base_margin
+        display_panel_y = self.panel_margin_v
+        dp_header_h = self.display_header_height
+        dp_animated_h = dp_header_h + int(self.display_content_height * dp_anim)
+        draw_panel(display_panel_x, display_panel_y, self.display_panel_width, dp_animated_h, "UI")
+        self._draw_panel_chevron(display_panel_x, display_panel_y, self.display_panel_width, self.display_panel_anim)
+        self._display_header_rect = pygame.Rect(display_panel_x, display_panel_y,
+                                                 self.display_panel_width, dp_header_h)
+
+        # Reposition display panel buttons and sliders
+        display_panel_sliders = [s for s in [self.hit_area_slider, self.ui_scale_slider]
+                                 if s and hasattr(s, '_panel_offset_x')]
+        self._reposition_panel_widgets(self.display_panel_buttons,
+                                       display_panel_x, display_panel_y, dp_anim, dp_animated_h)
+        self._reposition_panel_widgets(display_panel_sliders,
+                                       display_panel_x, display_panel_y, dp_anim, dp_animated_h)
+        self._ui_scale_slider_visible = getattr(self.ui_scale_slider, 'visible', False)
+        self._hit_area_slider_visible = getattr(self.hit_area_slider, 'visible', False)
+
+        # Draw buttons (non-display buttons always draw; display buttons gated by visible flag)
         for button in self.buttons:
             button.draw(self.ui_surface, self.font_small)
 
-        # Draw sides entry (for regular polygon creation)
-        if self.sides_entry:
+        # Draw sides entry (only when tools panel content is visible)
+        if self.sides_entry and getattr(self, '_tools_sides_entry_visible', False):
             self.sides_entry.draw(self.ui_surface, self.font_small)
 
         # Draw contextual instructions based on current mode
@@ -7615,18 +7893,23 @@ class Hayai:
         # Draw properties panel (right side)
         self.draw_properties_panel()
 
-        # Draw UI scale slider (bottom-right corner)
-        if self.ui_scale_slider:
+        # Draw UI panel sliders (inside display panel)
+        if self.ui_scale_slider and getattr(self, '_ui_scale_slider_visible', False):
             self.ui_scale_slider.draw(self.ui_surface, self.font_small)
+        if self.hit_area_slider and getattr(self, '_hit_area_slider_visible', False):
+            self.hit_area_slider.draw(self.ui_surface, self.font_small)
 
         # NOTE: Tooltips are drawn after hierarchy panel in draw() to ensure
         # they appear on top of the panel
 
     def draw_properties_panel(self):
-        """Draw the properties panel on right side"""
-        # Don't show selection UI when geometry display is off
+        """Draw the properties panel on right side (vertically collapsible, anchored to Imagery panel)"""
         if not self.show_geom:
             return
+
+        # Update animation state
+        update_panel_animation(self.properties_panel_anim)
+        pp_anim = self.properties_panel_anim.animation_progress
 
         # Determine what to show properties for
         selected_item = None
@@ -7634,7 +7917,6 @@ class Hayai:
         is_multi = False
 
         if len(self.selected_items) > 1:
-            # Multiple items selected
             is_multi = True
         elif self.selected_shape:
             selected_item = self.selected_shape
@@ -7642,81 +7924,104 @@ class Hayai:
             selected_item = self.selected_items[0]
             is_group = True
 
-        if not selected_item and not is_multi:
-            return
+        has_content = selected_item or is_multi
 
         # Update panel values when selection changes
         if selected_item:
             self.update_properties_panel()
 
         # Scale dimensions
-        panel_width = int(220 * self.ui_scale)
-        panel_x = WIDTH - panel_width - self.panel_margin
-        panel_y = self.panel_margin_v
-        padding = int(10 * self.ui_scale)
+        panel_width = self.properties_panel_width
+        padding = self.properties_panel_padding
         line_height = int(18 * self.ui_scale)
         border_radius = int(8 * self.ui_scale)
         slider_width = int(180 * self.ui_scale)
+        header_h = self.properties_header_height
 
-        # Panel height varies by content
+        # Anchor to Imagery panel left edge
+        imagery_left = self.imagery_panel.get_rect().x
+        panel_x = imagery_left - self.panel_margin - panel_width
+        panel_y = self.panel_margin_v
+
+        # Compute content height based on selection type
         if is_multi:
             count = len(self.selected_items)
-            max_visible = 10  # Max items to show before truncating
+            max_visible = 10
             visible_count = min(count, max_visible)
-            # Base height (header + count line) + name lines + potential "more" line
             extra_lines = 1 if count > max_visible else 0
-            panel_height = int((55 + (visible_count + extra_lines) * 18) * self.ui_scale)
+            content_height = int((27 + (visible_count + extra_lines) * 18) * self.ui_scale)
         elif is_group:
-            panel_height = int(120 * self.ui_scale)
+            content_height = int(92 * self.ui_scale)
+        elif selected_item:
+            content_height = self.properties_content_height
         else:
-            panel_height = int(500 * self.ui_scale)
+            content_height = int(30 * self.ui_scale)
 
-        # Draw panel background with rounded corners and border
-        panel_rect = pygame.Rect(panel_x, panel_y, panel_width, panel_height)
-        # Background
+        # Animated total height
+        animated_h = header_h + int(content_height * pp_anim)
+
+        # Draw panel background
+        panel_rect = pygame.Rect(panel_x, panel_y, panel_width, animated_h)
         pygame.draw.rect(self.ui_surface, (30, 30, 35, 230), panel_rect, border_radius=border_radius)
-        # Border - subtle gradient effect with inner highlight
         pygame.draw.rect(self.ui_surface, (60, 60, 70), panel_rect, width=2, border_radius=border_radius)
-        # Inner highlight line at top
         highlight_rect = pygame.Rect(panel_x + 2, panel_y + 2, panel_width - 4, 1)
         pygame.draw.rect(self.ui_surface, (80, 80, 90, 100), highlight_rect)
 
-        # Draw header
-        header = self.font_small.render("PROPERTIES", True, (120, 120, 130))
-        self.ui_surface.blit(header, (panel_x + padding, panel_y + int(8 * self.ui_scale)))
+        # Draw header with chevron
+        header_surf = self.font_small.render("PROPERTIES", True, (120, 120, 130))
+        self.ui_surface.blit(header_surf, (panel_x + padding, panel_y + int(8 * self.ui_scale)))
+        self._draw_panel_chevron(panel_x, panel_y, panel_width, self.properties_panel_anim)
+        self._properties_header_rect = pygame.Rect(panel_x, panel_y, panel_width, header_h)
+
+        # Store current panel position for event handling
+        self._properties_panel_x = panel_x
+        self._properties_panel_y = panel_y
+
+        # Skip content drawing if collapsed
+        if pp_anim < 0.05:
+            return
+
+        # Clip content drawing to animated panel bounds
+        content_clip = pygame.Rect(panel_x, panel_y + header_h, panel_width, int(content_height * pp_anim))
+        self.ui_surface.set_clip(content_clip)
+
+        if not has_content:
+            # Draw "no selection" message
+            msg_surf = self.font_small.render("No Shapes or Groups Selected", True, (100, 100, 110))
+            msg_x = panel_x + (panel_width - msg_surf.get_width()) // 2
+            msg_y = panel_y + header_h + int(8 * self.ui_scale)
+            self.ui_surface.blit(msg_surf, (msg_x, msg_y))
+            self.ui_surface.set_clip(None)
+            return
 
         if is_multi:
-            # Multiple items selected - show count and list names
             count = len(self.selected_items)
             max_visible = 10
             info_y = panel_y + int(35 * self.ui_scale)
 
-            # Header line with count
             count_text = f"{count} items selected"
             self.ui_surface.blit(self.font_small.render(count_text, True, (180, 180, 180)),
                                  (panel_x + padding, info_y))
             info_y += line_height
 
-            # List each item with type indicator
             max_name_width = slider_width - int(10 * self.ui_scale)
             for i, item in enumerate(self.selected_items[:max_visible]):
-                # Type indicator prefix
                 prefix = "[G] " if isinstance(item, Group) else "[S] "
                 name = prefix + item.name
-                # Truncate if needed
                 while self.font_small.size(name)[0] > max_name_width and len(name) > 8:
                     name = name[:-4] + "..."
                 self.ui_surface.blit(self.font_small.render(name, True, (160, 160, 160)),
                                      (panel_x + padding, info_y))
                 info_y += line_height
 
-            # Show overflow indicator if more items than visible limit
             if count > max_visible:
                 more_text = f"... and {count - max_visible} more"
                 self.ui_surface.blit(self.font_small.render(more_text, True, (120, 120, 130)),
                                      (panel_x + padding, info_y))
         elif is_group:
-            # For Groups: show name and transform info
+            # Reposition name input
+            self.name_input.rect.x = panel_x + self.name_input._panel_offset_x
+            self.name_input.rect.y = panel_y + self.name_input._panel_offset_y
             self.name_input.draw(self.ui_surface, self.font_small, self.ui_scale)
             group = selected_item
             info_y = panel_y + int(78 * self.ui_scale)
@@ -7727,36 +8032,41 @@ class Hayai:
             self.ui_surface.blit(self.font_small.render(rot_text, True, (160, 160, 160)),
                                  (panel_x + padding, info_y + line_height))
         else:
-            # For Shapes: show full panel
-            shape = selected_item
-
-            # Draw name input
+            # Reposition all controls using stored offsets
+            self.name_input.rect.x = panel_x + self.name_input._panel_offset_x
+            self.name_input.rect.y = panel_y + self.name_input._panel_offset_y
             self.name_input.draw(self.ui_surface, self.font_small, self.ui_scale)
 
             # Draw IMAGERY SOURCE section header
+            source_y = panel_y + self._pp_source_section_offset_y
             source_header = self.font_small.render("IMAGERY SOURCE", True, (120, 120, 130))
-            self.ui_surface.blit(source_header, (panel_x + padding, self.source_section_y))
-            # Draw separator line after header
-            line_y = self.source_section_y + int(14 * self.ui_scale)
+            self.ui_surface.blit(source_header, (panel_x + padding, source_y))
+            sep_y = source_y + int(14 * self.ui_scale)
             pygame.draw.line(self.ui_surface, (60, 60, 70),
-                           (panel_x + padding + source_header.get_width() + 8, line_y),
-                           (panel_x + padding + slider_width, line_y))
+                           (panel_x + padding + source_header.get_width() + 8, sep_y),
+                           (panel_x + padding + slider_width, sep_y))
 
             # Draw KEYSTONE section header
+            keystone_y = panel_y + self._pp_keystone_section_offset_y
             keystone_header = self.font_small.render("KEYSTONE", True, (120, 120, 130))
-            self.ui_surface.blit(keystone_header, (panel_x + padding, self.keystone_section_y))
-            # Draw separator line after header
-            line_y = self.keystone_section_y + int(14 * self.ui_scale)
+            self.ui_surface.blit(keystone_header, (panel_x + padding, keystone_y))
+            sep_y = keystone_y + int(14 * self.ui_scale)
             pygame.draw.line(self.ui_surface, (60, 60, 70),
-                           (panel_x + padding + keystone_header.get_width() + 8, line_y),
-                           (panel_x + padding + slider_width, line_y))
+                           (panel_x + padding + keystone_header.get_width() + 8, sep_y),
+                           (panel_x + padding + slider_width, sep_y))
 
-            # Draw Fit To Shape button
+            # Reposition and draw Fit To Shape button
+            self.btn_fit_warp.rect.x = panel_x + self.btn_fit_warp._panel_offset_x
+            self.btn_fit_warp.rect.y = panel_y + self.btn_fit_warp._panel_offset_y
             self.btn_fit_warp.draw(self.ui_surface, self.font_small)
 
-            # Draw sliders
+            # Reposition and draw sliders
             for slider in self.properties_sliders:
+                slider.rect.x = panel_x + slider._panel_offset_x
+                slider.rect.y = panel_y + slider._panel_offset_y
                 slider.draw(self.ui_surface, self.font_small)
+
+        self.ui_surface.set_clip(None)
 
     def draw_toasts(self):
         """Draw and manage toast notifications"""
@@ -7770,9 +8080,9 @@ class Hayai:
             y_offset += height
 
     def draw_contextual_instructions(self):
-        """Draw mode-specific instructions in a panel"""
-        if not self.show_hints:
-            return
+        """Draw mode-specific instructions in a collapsible panel (bottom-left, anchored to Scene panel)"""
+        update_panel_animation(self.hints_panel_anim)
+        hp_anim = self.hints_panel_anim.animation_progress
 
         # Common instructions
         common = [
@@ -7843,28 +8153,38 @@ class Hayai:
             default=0
         )
         panel_width = max_text_width + padding * 2 + int(10 * self.ui_scale)
-        panel_height = header_height + len(instructions) * line_height + padding
-        panel_x = WIDTH - panel_width - self.panel_margin
-        panel_y = HEIGHT - panel_height - self.panel_margin_v
+        content_height = len(instructions) * line_height + padding
 
-        # Draw panel background
-        panel_rect = pygame.Rect(panel_x, panel_y, panel_width, panel_height)
+        # Position: bottom-left, anchored to Scene panel right edge
+        panel_x = self.hierarchy_panel.get_rect().width + self.panel_margin
+        animated_h = header_height + int(content_height * hp_anim)
+        panel_y = HEIGHT - animated_h - self.panel_margin_v
+
+        # Draw panel background at animated height
+        panel_rect = pygame.Rect(panel_x, panel_y, panel_width, animated_h)
         pygame.draw.rect(self.ui_surface, (30, 30, 35, 230), panel_rect, border_radius=border_radius)
         pygame.draw.rect(self.ui_surface, (60, 60, 70), panel_rect, width=2, border_radius=border_radius)
         highlight_rect = pygame.Rect(panel_x + 2, panel_y + 2, panel_width - 4, 1)
         pygame.draw.rect(self.ui_surface, (80, 80, 90, 100), highlight_rect)
 
-        # Draw header
+        # Draw header with title and chevron
         header = self.font_small.render("HINTS", True, (120, 120, 130))
         self.ui_surface.blit(header, (panel_x + padding, panel_y + int(8 * self.ui_scale)))
+        self._draw_panel_chevron(panel_x, panel_y, panel_width, self.hints_panel_anim, upward_when_open=False)
+        self._hints_header_rect = pygame.Rect(panel_x, panel_y, panel_width, header_height)
 
-        # Draw instructions
-        y = panel_y + header_height
-        for inst in instructions:
-            if inst:  # Skip empty lines but use them for spacing
-                text = self.font_small.render(inst, True, (180, 180, 180))
-                self.ui_surface.blit(text, (panel_x + padding, y))
-            y += line_height
+        # Draw instructions (clipped to animated content area)
+        if hp_anim > 0.05:
+            clip_rect = pygame.Rect(panel_x, panel_y + header_height,
+                                    panel_width, int(content_height * hp_anim))
+            self.ui_surface.set_clip(clip_rect)
+            y = panel_y + header_height
+            for inst in instructions:
+                if inst:  # Skip empty lines but use them for spacing
+                    text = self.font_small.render(inst, True, (180, 180, 180))
+                    self.ui_surface.blit(text, (panel_x + padding, y))
+                y += line_height
+            self.ui_surface.set_clip(None)
 
     def handle_events(self):
         global WIDTH, HEIGHT
@@ -7903,36 +8223,54 @@ class Hayai:
             if self.imagery_panel.handle_event(event):
                 continue
 
+            # Handle panel header clicks (Display, Properties, Tools, Hints)
+            if not self.play_mode and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self._display_header_rect.collidepoint(event.pos):
+                    self.toggle_display_panel()
+                    continue
+                if self._properties_header_rect.collidepoint(event.pos):
+                    self.toggle_properties_panel()
+                    continue
+                if self._tools_header_rect.collidepoint(event.pos):
+                    self.toggle_tools_panel()
+                    continue
+                if self._hints_header_rect.collidepoint(event.pos):
+                    self.toggle_hints_panel()
+                    continue
+
             # Handle button events first if UI is visible
             if not self.play_mode:
-                for button in self.buttons:
-                    if button.handle_event(event):
-                        return
+                if any(button.handle_event(event) for button in self.buttons):
+                    continue
 
-            # Handle UI scale slider events (always available when UI is shown)
-            if not self.play_mode and self.ui_scale_slider:
+            # Handle UI scale slider events (only when visible in display panel)
+            if not self.play_mode and self.ui_scale_slider and getattr(self, '_ui_scale_slider_visible', False):
                 if self.ui_scale_slider.handle_event(event):
-                    return
+                    continue
 
-            # Handle sides entry events (for regular polygon creation)
-            if not self.play_mode and self.sides_entry:
+            # Handle hit area slider events (only when visible in display panel)
+            if not self.play_mode and self.hit_area_slider and getattr(self, '_hit_area_slider_visible', False):
+                if self.hit_area_slider.handle_event(event):
+                    continue
+
+            # Handle sides entry events (for regular polygon creation, only when tools panel content visible)
+            if not self.play_mode and self.sides_entry and getattr(self, '_tools_sides_entry_visible', False):
                 if self.sides_entry.handle_event(event):
-                    return
+                    continue
 
             # Handle properties panel events (sliders, buttons, and text input)
             # Check for either a selected shape OR a selected group
             has_properties_target = self.selected_shape or (len(self.selected_items) == 1 and isinstance(self.selected_items[0], Group))
             if not self.play_mode and has_properties_target:
                 if self.name_input and self.name_input.handle_event(event):
-                    return
+                    continue
                 # Only handle shape-specific controls when a shape is selected
                 if self.selected_shape:
                     # Handle properties panel buttons
                     if self.btn_fit_warp.handle_event(event):
-                        return
-                    for slider in self.properties_sliders:
-                        if slider.handle_event(event):
-                            return
+                        continue
+                    if any(slider.handle_event(event) for slider in self.properties_sliders):
+                        continue
 
             # Handle drag-and-drop for images/videos
             if event.type == pygame.DROPFILE:
@@ -7994,29 +8332,42 @@ class Hayai:
 
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    if self.fullscreen:
-                        self.toggle_fullscreen()
-                    elif (self.mode == self.MODE_MAKE_SHAPE
+                    if (self.mode == self.MODE_MAKE_SHAPE
                           and not self.placing_shape
                           and self.current_contour):
                         # Cancel freeform polygon in progress
                         self.current_contour = []
                         self.update_mode_button_states()
                         self.show_toast("Shape cancelled", 1.5)
+                    elif self.mode == self.MODE_EDIT_SHAPE and self.selected_vertex is not None:
+                        # Deselect current vertex
+                        self.selected_vertex = None
+                    elif self.selected_shape or self.selected_items:
+                        # Deselect current shape/group
+                        self.clear_selection()
                 elif event.key == pygame.K_F11:
                     self.toggle_fullscreen()
                 elif event.key == pygame.K_SPACE:
                     self.toggle_play_mode()
-                elif event.key == pygame.K_h:
-                    # Toggle hierarchy panel collapsed/expanded state with animation
+                elif event.key == pygame.K_s:
+                    # Toggle hierarchy (Scene) panel collapsed/expanded state with animation
                     self.hierarchy_panel.collapsed = not self.hierarchy_panel.collapsed
                     self.hierarchy_panel.animating = True
                     self.hierarchy_panel.animation_start = time.time()
+                elif event.key == pygame.K_h or (event.key == pygame.K_SLASH and pygame.key.get_mods() & pygame.KMOD_SHIFT):
+                    # Toggle hints panel (H or ?)
+                    self.toggle_hints_panel()
                 elif event.key == pygame.K_i:
                     # Toggle imagery panel collapsed/expanded state with animation
                     self.imagery_panel.collapsed = not self.imagery_panel.collapsed
                     self.imagery_panel.animating = True
                     self.imagery_panel.animation_start = time.time()
+                elif event.key == pygame.K_u and not (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                    self.toggle_display_panel()
+                elif event.key == pygame.K_p:
+                    self.toggle_properties_panel()
+                elif event.key == pygame.K_t:
+                    self.toggle_tools_panel()
                 elif event.key == pygame.K_g and pygame.key.get_mods() & pygame.KMOD_CTRL:
                     if pygame.key.get_mods() & pygame.KMOD_SHIFT:
                         # Ctrl+Shift+G: Ungroup
@@ -8598,6 +8949,10 @@ class Hayai:
         if self.mode == self.MODE_MAKE_SHAPE:
             self.draw_current_contour()
 
+        # Draw hit area visualization circles
+        if self.show_hit_areas and self.show_geom and not self.play_mode:
+            self.draw_hit_area_visualization()
+
         # Draw UI elements
         self.draw_ui()
 
@@ -8621,7 +8976,11 @@ class Hayai:
         hierarchy_rect = self.hierarchy_panel.get_rect()
         imagery_rect = self.imagery_panel.get_rect()
         over_panel = ((hierarchy_rect.collidepoint(mouse_pos) or
-                       imagery_rect.collidepoint(mouse_pos)) and not self.play_mode)
+                       imagery_rect.collidepoint(mouse_pos) or
+                       self._display_header_rect.collidepoint(mouse_pos) or
+                       self._properties_header_rect.collidepoint(mouse_pos) or
+                       self._tools_header_rect.collidepoint(mouse_pos) or
+                       self._hints_header_rect.collidepoint(mouse_pos)) and not self.play_mode)
 
         if not over_panel:
             for button in self.buttons:
@@ -8631,12 +8990,32 @@ class Hayai:
                 self.btn_fit_warp.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
             # Draw slider and numeric entry tooltips
             self.ui_scale_slider.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
+            self.hit_area_slider.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
             self.sides_entry.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
 
         # Draw panel tooltips (always shown when appropriate)
         if not self.play_mode:
             self.hierarchy_panel.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
             self.imagery_panel.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
+
+            # Draw header bar tooltips for collapsible panels
+            header_tooltips = {
+                'display': (self._display_header_rect, "Toggle UI panel (U)"),
+                'properties': (self._properties_header_rect, "Toggle properties panel (P)"),
+                'tools': (self._tools_header_rect, "Toggle tools panel (T)"),
+                'hints': (self._hints_header_rect, "Toggle hints panel (H)"),
+            }
+            now = time.time()
+            for name, (rect, tip_text) in header_tooltips.items():
+                hovered = rect.collidepoint(mouse_pos) and rect.width > 0
+                was_hovered, hover_start = self._header_hover[name]
+                if hovered and not was_hovered:
+                    self._header_hover[name] = (True, now)
+                elif hovered:
+                    if now - hover_start >= TOOLTIP_DELAY:
+                        draw_tooltip_at_cursor(self.ui_surface, self.font_small, tip_text, self.ui_scale)
+                else:
+                    self._header_hover[name] = (False, 0.0)
 
         # Draw context menu (always on top)
         self.context_menu.draw(self.ui_surface, self.font)
@@ -8664,8 +9043,7 @@ class Hayai:
         pygame.display.flip()
 
     def run(self):
-        self.set_mode(self.MODE_MAKE_SHAPE)
-        self.btn_create_freeform.active = True
+        self.start_regular_placement()
 
         while self.running:
             # Update master animation timing for all imagery items
