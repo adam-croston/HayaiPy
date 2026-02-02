@@ -64,6 +64,12 @@ except ImportError:
 if sys.platform == 'win32':
     try:
         ctypes.windll.user32.SetProcessDPIAware()
+        # Pin this thread to System DPI Aware so that Tcl/Tk's process-level
+        # DPI change to Per-Monitor doesn't shift overlay coordinates.
+        try:
+            ctypes.windll.user32.SetThreadDpiAwarenessContext(ctypes.c_void_p(-2))
+        except (AttributeError, OSError):
+            pass  # Not available on Windows < 10 1607
     except Exception:
         pass
 
@@ -1643,6 +1649,8 @@ if DESKTOP_CAPTURE_AVAILABLE:
 
         _CAPTURE_TIMER_ID = 1
         _CAPTURE_TIMER_INTERVAL = 16  # ~60fps in milliseconds
+        _FLASH_TIMER_ID = 2
+        _FLASH_TIMER_INTERVAL = 83  # ms per toggle; 6 toggles = ~500ms for 3 flashes
 
         def __init__(self, x: int, y: int, width: int, height: int,
                      border_color: Tuple[int, int, int] = (0, 255, 0)):
@@ -1658,6 +1666,8 @@ if DESKTOP_CAPTURE_AVAILABLE:
             self._on_resize_callback = None
             self._on_capture_callback = None
             self._in_modal_loop = False
+            self._flash_remaining = 0
+            self._flash_is_bright = False
 
             if not DesktopOverlayWindow._wnd_class_registered:
                 self._register_window_class()
@@ -1836,12 +1846,29 @@ if DESKTOP_CAPTURE_AVAILABLE:
             return 0
 
         def _on_timer(self, hwnd, msg, wparam, lparam):
-            """Timer tick - call capture callback."""
+            """Timer tick - call capture callback or handle flash animation."""
             if wparam == self._CAPTURE_TIMER_ID and self._on_capture_callback:
                 try:
                     self._on_capture_callback()
                 except Exception:
                     pass
+            elif wparam == self._FLASH_TIMER_ID:
+                self._flash_remaining -= 1
+                if self._flash_remaining <= 0:
+                    # Flash finished - restore normal alpha
+                    _user32.KillTimer(hwnd, self._FLASH_TIMER_ID)
+                    win32gui.SetLayeredWindowAttributes(
+                        hwnd, 0, 40, win32con.LWA_ALPHA
+                    )
+                    self._flash_is_bright = False
+                    self._flash_remaining = 0
+                else:
+                    # Toggle between bright and dim
+                    self._flash_is_bright = not self._flash_is_bright
+                    alpha = 255 if self._flash_is_bright else 40
+                    win32gui.SetLayeredWindowAttributes(
+                        hwnd, 0, alpha, win32con.LWA_ALPHA
+                    )
             return 0
 
         def set_callbacks(self, on_move=None, on_resize=None, on_capture=None):
@@ -1855,6 +1882,30 @@ if DESKTOP_CAPTURE_AVAILABLE:
             self.border_color = color
             if self.hwnd:
                 win32gui.InvalidateRect(self.hwnd, None, True)
+
+        def flash(self):
+            """Flash the overlay fully opaque 3 times over ~500ms."""
+            if not self.hwnd:
+                return
+            # Cancel any in-progress flash
+            _user32.KillTimer(self.hwnd, self._FLASH_TIMER_ID)
+            # Show window if hidden
+            if not self.visible:
+                win32gui.ShowWindow(self.hwnd, win32con.SW_SHOWNOACTIVATE)
+                win32gui.SetWindowPos(
+                    self.hwnd, win32con.HWND_TOPMOST,
+                    self.x, self.y, self.width, self.height,
+                    win32con.SWP_NOACTIVATE
+                )
+                self.visible = True
+            # Set fully opaque immediately (first bright state)
+            win32gui.SetLayeredWindowAttributes(
+                self.hwnd, 0, 255, win32con.LWA_ALPHA
+            )
+            self._flash_is_bright = True
+            self._flash_remaining = 5  # 5 more toggles after initial bright
+            _user32.SetTimer(self.hwnd, self._FLASH_TIMER_ID,
+                             self._FLASH_TIMER_INTERVAL, None)
 
         def show(self):
             """Show the overlay window."""
@@ -1887,8 +1938,21 @@ if DESKTOP_CAPTURE_AVAILABLE:
                 )
                 win32gui.InvalidateRect(self.hwnd, None, True)
 
+        def sync_from_window(self):
+            """Query the actual Win32 window position and update stored fields."""
+            if self.hwnd:
+                try:
+                    rect = win32gui.GetWindowRect(self.hwnd)
+                    self.x = rect[0]
+                    self.y = rect[1]
+                    self.width = rect[2] - rect[0]
+                    self.height = rect[3] - rect[1]
+                except Exception:
+                    pass
+
         def get_capture_region(self) -> Dict[str, int]:
             """Get the capture region (inside the border)."""
+            self.sync_from_window()
             return {
                 "left": self.x + self.border_width,
                 "top": self.y + self.border_width,
@@ -1904,6 +1968,9 @@ if DESKTOP_CAPTURE_AVAILABLE:
         def cleanup(self):
             """Destroy the overlay window."""
             if self.hwnd:
+                if self._flash_remaining > 0:
+                    _user32.KillTimer(self.hwnd, self._FLASH_TIMER_ID)
+                    self._flash_remaining = 0
                 if self._in_modal_loop:
                     _user32.KillTimer(self.hwnd, self._CAPTURE_TIMER_ID)
                     self._in_modal_loop = False
@@ -2186,8 +2253,13 @@ class ImageryItem:
                 return
 
         # Get overlay region or use stored coords
-        if self._overlay_window is not None and self._overlay_window.visible:
+        if self._overlay_window is not None and self._overlay_window.hwnd:
             region = self._overlay_window.get_capture_region()
+            # Keep stored coords in sync with actual window position
+            self.capture_x = self._overlay_window.x
+            self.capture_y = self._overlay_window.y
+            self.capture_width = self._overlay_window.width
+            self.capture_height = self._overlay_window.height
         else:
             border = 4
             region = {
@@ -2256,12 +2328,36 @@ class ImageryItem:
                 on_capture=self._modal_capture_and_render
             )
 
+            # Sync capture coords from overlay's actual position — Windows may
+            # have adjusted coordinates during CreateWindowEx (DPI, monitor
+            # bounds, etc.) before callbacks were installed.
+            self.capture_x = self._overlay_window.x
+            self.capture_y = self._overlay_window.y
+            self.capture_width = self._overlay_window.width
+            self.capture_height = self._overlay_window.height
+        else:
+            # Overlay already exists — push stored coords so both sides agree.
+            self._overlay_window.update_position(
+                self.capture_x, self.capture_y,
+                self.capture_width, self.capture_height
+            )
+
         self._overlay_window.show()
         self.capture_overlay_visible = True
+
+    def sync_from_overlay(self):
+        """Pull actual window coordinates from the overlay into stored fields."""
+        if self._overlay_window is not None and self._overlay_window.hwnd:
+            self._overlay_window.sync_from_window()
+            self.capture_x = self._overlay_window.x
+            self.capture_y = self._overlay_window.y
+            self.capture_width = self._overlay_window.width
+            self.capture_height = self._overlay_window.height
 
     def hide_overlay(self):
         """Hide the desktop overlay window."""
         if self._overlay_window is not None:
+            self.sync_from_overlay()
             self._overlay_window.hide()
         self.capture_overlay_visible = False
 
@@ -2272,10 +2368,19 @@ class ImageryItem:
         else:
             self.show_overlay()
 
+    def flash_overlay(self):
+        """Flash the desktop overlay window to make it easy to locate."""
+        if not DESKTOP_CAPTURE_AVAILABLE:
+            return
+        # Create overlay if it doesn't exist yet
+        self.show_overlay()
+        self._overlay_window.flash()
+
     def cleanup_capture(self):
         """Cleanup capture resources."""
         self.stop_capture()
         if self._overlay_window is not None:
+            self.sync_from_overlay()
             self._overlay_window.cleanup()
             self._overlay_window = None
 
@@ -2403,6 +2508,9 @@ class ImageryItem:
 
     def to_dict(self) -> dict:
         """Serialize to dictionary (excludes surfaces)."""
+        # Sync overlay coords before saving so stored values are accurate
+        if self.imagery_type == "capture":
+            self.sync_from_overlay()
         data = {
             'id': self.id,
             'name': self.name,
@@ -2597,7 +2705,7 @@ class ImageryManager:
 
     def from_dict(self, data: dict):
         """Deserialize manager state from dictionary."""
-        self.items.clear()
+        self.clear()
         self.item_counter = data.get('counter', 0)
         for item_data in data.get('items', []):
             item = ImageryItem.from_dict(item_data)
@@ -2612,6 +2720,14 @@ class ImageryManager:
             item.cleanup()
         self.items.clear()
         self.item_counter = 0
+
+    def reshow_overlays(self):
+        """Re-show any capture overlays that should be visible (e.g., after a dialog steals focus)."""
+        if not DESKTOP_CAPTURE_AVAILABLE:
+            return
+        for item in self.items.values():
+            if item.is_capture() and item.capture_overlay_visible and item._overlay_window is not None:
+                item._overlay_window.show()
 
     def process_overlay_messages(self):
         """Process Windows messages for all visible capture overlays."""
@@ -3796,6 +3912,10 @@ class ScenePanel:
         - "into": Row highlight on Group → insert into Group at end
         - "after_root": Below all items → insert at end of root level
         """
+        # Verify dragged item still exists in scene
+        all_items = self.app.get_all_items_flat()
+        if item not in all_items:
+            return
         self.app.save_undo_state()
 
         if position == "into" and isinstance(target, Group):
@@ -4233,6 +4353,7 @@ class ImageryPanel:
         # Tooltip state
         self.chevron_hovered = False
         self.chevron_hover_start = 0.0
+        self.button_hover_start = 0.0
 
         # Expandable details state
         self.expanded_item: Optional[ImageryItem] = None  # Currently expanded item
@@ -4584,10 +4705,16 @@ class ImageryPanel:
             # Button hover
             if not self.collapsed and self.animation_progress > 0.95:
                 btn_image, btn_anim, btn_capture, btn_pipe = self._get_add_buttons_rect()
+                was_any = (self.hover_add_image or self.hover_add_anim
+                           or self.hover_add_capture or self.hover_add_pipe)
                 self.hover_add_image = btn_image.collidepoint(event.pos)
                 self.hover_add_anim = btn_anim.collidepoint(event.pos)
                 self.hover_add_capture = btn_capture.collidepoint(event.pos)
                 self.hover_add_pipe = btn_pipe.collidepoint(event.pos)
+                is_any = (self.hover_add_image or self.hover_add_anim
+                          or self.hover_add_capture or self.hover_add_pipe)
+                if is_any and not was_any:
+                    self.button_hover_start = time.time()
 
                 # Row hover
                 content_rect = self.get_content_rect()
@@ -4623,6 +4750,12 @@ class ImageryPanel:
                 self.rename_text = self.rename_text[:self.rename_cursor] + event.unicode + self.rename_text[self.rename_cursor:]
                 self.rename_cursor += 1
                 return True
+            return True
+
+        # Handle DELETE key for selected imagery item
+        if (event.type == pygame.KEYDOWN and event.key == pygame.K_DELETE
+                and not self.collapsed and self.selected_item):
+            self._delete_selected()
             return True
 
         # Click outside rename
@@ -4674,6 +4807,7 @@ class ImageryPanel:
             item = self.app.imagery_manager.create_item(path)
             self.selected_item = item
             self.app.show_toast(f"Added imagery: {item.name}", 2.0, "success")
+            self.app.assign_imagery_from_panel(item.id)
 
     def _add_anim(self):
         """Open file dialog to add animation/video."""
@@ -4688,6 +4822,7 @@ class ImageryPanel:
             item = self.app.imagery_manager.create_item(path)
             self.selected_item = item
             self.app.show_toast(f"Added animation: {item.name}", 2.0, "success")
+            self.app.assign_imagery_from_panel(item.id)
 
     def _add_capture(self):
         """Add a desktop capture rect."""
@@ -4700,6 +4835,7 @@ class ImageryPanel:
             self.selected_item = item
             item.show_overlay()
             self.app.show_toast(f"Added capture: {item.name}", 2.0, "success")
+            self.app.assign_imagery_from_panel(item.id)
 
     def _add_pipe(self):
         """Show dialog to add a video pipe receiver."""
@@ -4748,6 +4884,7 @@ class ImageryPanel:
         if item:
             self.selected_item = item
             self.app.show_toast(f"Added pipe: {item.name}", 2.0, "success")
+            self.app.assign_imagery_from_panel(item.id)
 
     def _handle_file_drop(self, file_path: str):
         """Handle file dropped onto panel."""
@@ -4757,6 +4894,7 @@ class ImageryPanel:
             item = self.app.imagery_manager.create_item(file_path)
             self.selected_item = item
             self.app.show_toast(f"Added: {item.name}", 2.0, "success")
+            self.app.assign_imagery_from_panel(item.id)
         else:
             self.app.show_toast("Unsupported file type", 2.0, "error")
 
@@ -4788,6 +4926,7 @@ class ImageryPanel:
         if self.selected_item.is_capture():
             overlay_label = "Hide Overlay" if self.selected_item.capture_overlay_visible else "Show Overlay"
             items.insert(0, (overlay_label, lambda: self._toggle_overlay()))
+            items.insert(1, ("Flash Overlay", lambda: self._flash_overlay()))
 
         self.app.context_menu.show(pos[0], pos[1], items)
 
@@ -4795,6 +4934,11 @@ class ImageryPanel:
         """Toggle overlay visibility for selected capture item."""
         if self.selected_item and self.selected_item.is_capture():
             self.selected_item.toggle_overlay()
+
+    def _flash_overlay(self):
+        """Flash the overlay for the selected capture item."""
+        if self.selected_item and self.selected_item.is_capture():
+            self.selected_item.flash_overlay()
 
     def _delete_selected(self):
         """Delete the selected imagery item."""
@@ -5162,6 +5306,28 @@ class ImageryPanel:
                 tooltip_text = "Expand imagery panel" if self.collapsed else "Collapse imagery panel"
                 draw_tooltip_at_cursor(surface, font, tooltip_text, scale)
 
+        # Add button tooltips
+        any_btn_hovered = (self.hover_add_image or self.hover_add_anim
+                           or self.hover_add_capture or self.hover_add_pipe)
+        if any_btn_hovered:
+            elapsed = time.time() - self.button_hover_start
+            if elapsed >= TOOLTIP_DELAY:
+                if self.hover_add_image:
+                    tip = "Add an image"
+                elif self.hover_add_anim:
+                    tip = "Add an animation"
+                elif self.hover_add_capture:
+                    if DESKTOP_CAPTURE_AVAILABLE:
+                        tip = "Add a desktop capture"
+                    else:
+                        tip = "Desktop capture requires Windows (mss + pywin32 not installed)"
+                elif self.hover_add_pipe:
+                    if VIDEOPIPE_AVAILABLE:
+                        tip = "Add a video pipe (Spout)"
+                    else:
+                        tip = "Video pipe requires Windows (SpoutGL not installed)"
+                draw_tooltip_at_cursor(surface, font, tip, scale)
+
 
 class Hayai:
     # Modes
@@ -5206,7 +5372,7 @@ class Hayai:
         self.show_crosshair = True  # Crosshair toggle (on by default)
         self.show_cursor = True  # System cursor visibility
         self.show_grid = True  # Background grid (on by default)
-        self.show_controls = True  # Controls panel visibility (on by default)
+        self.show_hints = True  # Hints panel visibility (on by default)
         self.mouse_pos = (0, 0)  # Track mouse position for shape preview
 
         # Shape placement mode
@@ -5371,6 +5537,7 @@ class Hayai:
     def rebuild_shapes_list(self):
         """Rebuild flat shapes list from scene_root hierarchy."""
         self.shapes = self.get_all_shapes_flat()
+        self.hierarchy_panel._build_visible_rows()
 
     def get_all_shapes_flat(self) -> List[Shape]:
         """Get all shapes in draw order (depth-first traversal, bottom of hierarchy = on top)."""
@@ -5815,6 +5982,12 @@ class Hayai:
         """Clear all selection."""
         self.selected_items = []
         self.selected_shape = None
+        # Reset hierarchy panel drag state to prevent stale references
+        self.hierarchy_panel.drag_start_pos = None
+        self.hierarchy_panel.drag_start_item = None
+        self.hierarchy_panel.dragging_item = None
+        self.hierarchy_panel.drop_target = None
+        self.update_selection_from_items()
         self.update_mode_button_states()
 
     def complete_marquee_selection(self, force_individual: bool = False):
@@ -6170,12 +6343,12 @@ class Hayai:
         self.buttons.append(self.btn_grid_toggle)
 
         display_btn_y += btn_h + gap
-        # Controls toggle
-        self.btn_controls_toggle = Button(display_btn_x, display_btn_y, btn_w, btn_h,
-                                          "Controls: ON" if self.show_controls else "Controls: OFF",
-                                          self.toggle_controls, tooltip="Toggle controls panel")
-        self.btn_controls_toggle.active = not self.show_controls
-        self.buttons.append(self.btn_controls_toggle)
+        # Hints toggle
+        self.btn_hints_toggle = Button(display_btn_x, display_btn_y, btn_w, btn_h,
+                                       "Hints: ON" if self.show_hints else "Hints: OFF",
+                                       self.toggle_hints, tooltip="Toggle hints panel")
+        self.btn_hints_toggle.active = not self.show_hints
+        self.buttons.append(self.btn_hints_toggle)
 
         # UI Scale slider position (will be created in create_scale_slider)
         self.display_slider_y = display_btn_y + btn_h + int(12 * self.ui_scale)
@@ -6462,7 +6635,7 @@ class Hayai:
         self._sync_display_toggle_button(self.btn_crosshair_toggle, "Cross", self.show_crosshair)
         self._sync_display_toggle_button(self.btn_cursor_toggle, "Cursor", self.show_cursor)
         self._sync_display_toggle_button(self.btn_grid_toggle, "Grid", self.show_grid)
-        self._sync_display_toggle_button(self.btn_controls_toggle, "Controls", self.show_controls)
+        self._sync_display_toggle_button(self.btn_hints_toggle, "Hints", self.show_hints)
 
     def _toggle_display(self, attr: str, button, label: str):
         """Toggle a display boolean and sync its button state."""
@@ -6485,8 +6658,8 @@ class Hayai:
     def toggle_grid(self):
         self._toggle_display('show_grid', self.btn_grid_toggle, "Grid")
 
-    def toggle_controls(self):
-        self._toggle_display('show_controls', self.btn_controls_toggle, "Controls")
+    def toggle_hints(self):
+        self._toggle_display('show_hints', self.btn_hints_toggle, "Hints")
 
     def toggle_play_mode(self):
         self.play_mode = not self.play_mode
@@ -6750,6 +6923,7 @@ class Hayai:
             filetypes=[("Hayai Scene", "*.hayai"), ("JSON", "*.json")]
         )
         root.destroy()
+        self.imagery_manager.reshow_overlays()
         if path:
             data = {
                 'version': 3,  # Version 3 = imagery system
@@ -6768,6 +6942,7 @@ class Hayai:
             filetypes=[("Hayai Scene", "*.hayai"), ("JSON", "*.json")]
         )
         root.destroy()
+        self.imagery_manager.reshow_overlays()
         if path:
             with open(path, 'r') as f:
                 data = json.load(f)
@@ -7596,7 +7771,7 @@ class Hayai:
 
     def draw_contextual_instructions(self):
         """Draw mode-specific instructions in a panel"""
-        if not self.show_controls:
+        if not self.show_hints:
             return
 
         # Common instructions
@@ -7617,6 +7792,7 @@ class Hayai:
                     "Click to add vertices",
                     "Click near start to close",
                     "ENTER: Close polygon",
+                    "ESC: Cancel",
                 ]
         elif self.mode == self.MODE_MOVE_SHAPE:
             mode_instructions = [
@@ -7661,15 +7837,12 @@ class Hayai:
         border_radius = int(8 * self.ui_scale)
         header_height = int(28 * self.ui_scale)
 
-        # Find widest instruction for panel width
-        max_width = 0
-        for inst in instructions:
-            if inst:
-                w = self.font_small.size(inst)[0]
-                if w > max_width:
-                    max_width = w
-
-        panel_width = max_width + padding * 2 + int(10 * self.ui_scale)
+        # Size panel to fit widest instruction
+        max_text_width = max(
+            (self.font_small.size(inst)[0] for inst in instructions if inst),
+            default=0
+        )
+        panel_width = max_text_width + padding * 2 + int(10 * self.ui_scale)
         panel_height = header_height + len(instructions) * line_height + padding
         panel_x = WIDTH - panel_width - self.panel_margin
         panel_y = HEIGHT - panel_height - self.panel_margin_v
@@ -7682,7 +7855,7 @@ class Hayai:
         pygame.draw.rect(self.ui_surface, (80, 80, 90, 100), highlight_rect)
 
         # Draw header
-        header = self.font_small.render("CONTROLS", True, (120, 120, 130))
+        header = self.font_small.render("HINTS", True, (120, 120, 130))
         self.ui_surface.blit(header, (panel_x + padding, panel_y + int(8 * self.ui_scale)))
 
         # Draw instructions
@@ -7822,7 +7995,14 @@ class Hayai:
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     if self.fullscreen:
-                        self.toggle_fullscreen()  # Exit fullscreen
+                        self.toggle_fullscreen()
+                    elif (self.mode == self.MODE_MAKE_SHAPE
+                          and not self.placing_shape
+                          and self.current_contour):
+                        # Cancel freeform polygon in progress
+                        self.current_contour = []
+                        self.update_mode_button_states()
+                        self.show_toast("Shape cancelled", 1.5)
                 elif event.key == pygame.K_F11:
                     self.toggle_fullscreen()
                 elif event.key == pygame.K_SPACE:
@@ -8324,12 +8504,12 @@ class Hayai:
                         # Adjust perspective on the selected axis
                         delta = event.y * 0.05
                         if self.selected_shape.perspective_axis == 0:
-                            self.selected_shape.perspective_x = max(-2.0, min(2.0,
+                            self.selected_shape.perspective_x = max(-1.0, min(1.0,
                                 self.selected_shape.perspective_x + delta))
                             # Sync slider
                             self.persp_x_slider.value = self.selected_shape.perspective_x
                         else:
-                            self.selected_shape.perspective_y = max(-2.0, min(2.0,
+                            self.selected_shape.perspective_y = max(-1.0, min(1.0,
                                 self.selected_shape.perspective_y + delta))
                             # Sync slider
                             self.persp_y_slider.value = self.selected_shape.perspective_y

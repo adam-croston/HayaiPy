@@ -1,7 +1,9 @@
+# Full dependency list (includes Windows-only packages for desktop capture and video pipe)
+# For macOS/Linux, use requirements-base.txt instead
 numpy==2.2.6
 opencv-python==4.11.0.86
 pillow==12.1.0
-pygame==2.6.1
+pygame-ce>=2.5.0
 PyOpenGL==3.1.10
 PyOpenGL-accelerate==3.1.10
 mss>=9.0.0

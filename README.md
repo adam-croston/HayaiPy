@@ -20,80 +20,188 @@ Hayai is a fast, free, and beginner-friendly projection mapping tool with perspe
 
 ## Installation
 
-### Requirements
+> **Primary platform: Windows.**
+- Core features (shape creation, texture mapping, animations) should work on macOS and Linux but have not been tested.
+- Desktop Capture and Video Pipe (Spout) features currerntly requires Windows.
 
-- Python 3.10 or higher
-- Windows (macOS/Linux support not yet tested)
+### Step 1 - Install Python
 
-### Quick Start
+You need Python 3.10 or higher. If you already have it, skip to Step 2.
 
-1. **Install Python** (if you haven't already):
+<details>
+<summary><strong>Windows</strong></summary>
 
-   1.1. Download Python 3.10+ from [python.org](https://www.python.org/downloads/)
+1. Go to [python.org/downloads](https://www.python.org/downloads/) and click the big yellow download button.
+2. Run the installer. **Important: check the "Add Python to PATH" box** at the bottom of the first screen before clicking Install.
+3. Open a terminal to verify: press `Win+R`, type `cmd`, press Enter, then type `python --version`. You should see something like `Python 3.12.x`.
 
-   1.2. During installation, check "Add Python to PATH"
+</details>
 
-2. **Clone or download** this repository
+<details>
+<summary><strong>macOS</strong></summary>
 
-3. **Navigate into it**- into the top level folder of the local repository.
+1. Go to [python.org/downloads](https://www.python.org/downloads/) and download the macOS installer.
+2. Run the `.pkg` file and follow the prompts.
+3. Open Terminal (Applications > Utilities > Terminal) and type `python3 --version`. You should see something like `Python 3.12.x`.
 
-4. **Create and Activate a virtual environment** (optional, but recommended):
+> *Advanced users: you can also install via [Homebrew](https://brew.sh) with `brew install python`.*
 
-   4.1. Create it:
+</details>
 
-         ```bash
-         python -m venv .venv
-         ```
+<details>
+<summary><strong>Linux</strong></summary>
 
-   4.2. Activate it:
+Open a terminal and run `sudo apt install python3 python3-venv python3-pip`. *(If you're not on Ubuntu/Debian, use your distribution's package manager.)*
 
-         ```bash
-         # Windows
-         .venv\Scripts\activate
+Verify with `python3 --version`.
 
-         # macOS/Linux
-         source .venv/bin/activate
-         ```
+</details>
 
-5. **Install dependencies**:
+### Step 2 - Download Hayai
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+1. Go to the [Hayai GitHub page](https://github.com/acroston/HayaiPY).
+2. Click the green **Code** button near the top-right.
+3. Click **Download ZIP**.
+4. Find the downloaded `.zip` file (usually in your Downloads folder), right-click it, and **extract** (unzip) it to a location of your choice. This creates a folder with all of Hayai's files inside.
 
-6. **Run Hayai**:
+### Step 3 - Open a Terminal in the Hayai Folder
 
-   ```bash
-   python hayai.py
-   ```
+You need a terminal (also called "command prompt") open inside the folder you just extracted.
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+1. Open the extracted Hayai folder in File Explorer.
+2. Click the **address bar** at the top (where it shows the folder path).
+3. Type `cmd` and press **Enter**. A Command Prompt window will open, already in the right folder.
+
+</details>
+
+<details>
+<summary><strong>macOS</strong></summary>
+
+1. Open **Terminal** (Applications > Utilities > Terminal).
+2. Type `cd ` (with a space after it), then **drag the Hayai folder** from Finder into the Terminal window. Press **Enter**.
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+Right-click inside the Hayai folder and choose **Open Terminal Here**. Or open a terminal and type `cd /path/to/HayaiPY` (substituting the actual path).
+
+</details>
+
+### Step 4 - Set Up a Virtual Environment (Optional)
+
+This step is optional but recommended. A virtual environment is a private space for Hayai's dependencies so they don't interfere with other software on your computer. If you skip this step, the remaining steps still work the same.
+
+**Create it:** `python -m venv .venv`
+
+> On macOS/Linux, you may need to use `python3` instead of `python` for this and all following commands.
+
+**Activate it:**
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+`.venv\Scripts\activate`
+
+</details>
+
+<details>
+<summary><strong>macOS / Linux</strong></summary>
+
+`source .venv/bin/activate`
+
+</details>
+
+You'll know it worked when your terminal prompt changes to show `(.venv)` at the beginning.
+
+### Step 5 - Install Dependencies
+
+<details>
+<summary><strong>Windows</strong></summary>
+
+`pip install -r requirements.txt`
+
+This installs everything, including Windows-only features like desktop capture and video pipe.
+
+</details>
+
+<details>
+<summary><strong>macOS / Linux</strong></summary>
+
+`pip install -r requirements-base.txt`
+
+This installs the cross-platform dependencies. Desktop Capture and Video Pipe features are not available on macOS/Linux.
+
+</details>
+
+### Step 6 - Run Hayai
+
+`python hayai.py`
+
+The Hayai window should appear. You're ready to go!
+
+### Troubleshooting
+
+- **`python` is not recognized / not found** - Python wasn't added to your system PATH. On Windows, re-run the Python installer and check "Add Python to PATH". On macOS/Linux, try `python3` instead.
+- **`pip` is not recognized / not found** - Try `python -m pip install -r requirements.txt` instead.
+- **Permission errors on macOS/Linux** - Don't use `sudo`. Make sure you're inside an activated virtual environment (Step 4).
 
 ### Dependencies
 
-- pygame
-- PyOpenGL + PyOpenGL-accelerate
-- Pillow
-- NumPy
-- opencv-python (for video file support)
-- mss + pywin32 (for desktop capture)
-- SpoutGL (for video pipe input)
+*You don't need to install these individually - the requirements files handle everything automatically.*
+
+**Core** (all platforms - included in both `requirements.txt` and `requirements-base.txt`):
+
+| Package | What it does |
+|---------|-------------|
+| pygame-ce | Window management and user interface |
+| PyOpenGL + PyOpenGL-accelerate | GPU-accelerated graphics rendering |
+| Pillow | Image loading and processing |
+| NumPy | Math operations for coordinate transforms |
+| opencv-python | Video file playback (MP4, AVI, MOV) |
+
+**Windows-only** (included in `requirements.txt` only):
+
+| Package | What it does |
+|---------|-------------|
+| mss | Screen capture for the Desktop Capture feature |
+| pywin32 | Windows system integration for desktop capture |
+| SpoutGL | Video pipe input from other applications via the Spout protocol |
 
 ## Usage
 
 Hayai is designed for video projection mapping where the projector displays onto physical surfaces. The application starts in windowed mode-press **F11** for fullscreen when projecting.
 
-### Quick Start Guide
+### Workflow
 
-1. **Create a shape**: Click "Freeform" or "Regular" to start creating shapes
-2. **Add imagery**: Expand the imagery panel (right edge), click + to add an image, animation, desktop capture, or video pipe
-3. **Assign to shape**: Select a shape, then click an imagery item to assign it
-4. **Edit the Keystone**: Click "Edit Keystone" mode and drag corners for perspective correction
-5. **Go live**: Press **SPACE** to hide the UI and show only your mapped content
+1. **Physical Setup**: Position your projector aimed at the target surface(s). Use **F11** for fullscreen on your projector output.
+2. **Create Shapes**: Click "Freeform" or "Regular" to trace the edges of physical surfaces
+3. **Fine-Tune Shapes**: Switch to "Edit Shape" mode to add, remove, or move vertices to refine your shapes
+4. **Add Imagery**: Select shape(s), then expand the imagery panel (right edge or press **I**) and click + to add an image, animation, desktop capture, or video pipe - imagery is automatically assigned to the selected shape(s). You can also reassign imagery later by selecting a shape and clicking a different imagery item.
+5. **Fine-Tune Imagery**: Adjust HSV and alpha for color matching between surfaces
+6. **Keystone Correction**: Click "Edit Keystone" mode and drag the 4 corners to match the perspective of each surface
+7. **Fine-Tune Keystone Correction**: In the Properties panel edit the Perspective X and Perspective Y sliders to adjust more extreme perpsective effects. You can also use the mouse wheel to adjust these values and mouse middle click to switch between adjusting perspective X and Perspective Y.
+8. **Go Live**: Press **SPACE** to hide the UI and show only your mapped content.
+
+### Tips for Live Performance
+
+1. **Use F11** to go fullscreen on your projector output
+2. **Prepare your scene** ahead of time and save it
+3. **Press SPACE** to hide all UI elements during the show
+4. **Use groups** to move multiple shapes together and assign imagery together
+5. **Animated GIFs and videos** loop automatically-great for dynamic content
+6. **Desktop capture** can display live content from other applications like synchronized youtube videos or music visualizers
+7. **Spout input** enables integration with VJ software like Resolume, TouchDesigner, etc.
 
 ### Operating Modes
 
 | Mode | Description |
 |------|-------------|
-| **Freeform** | Click to place vertices, click near start or press ENTER to close |
+| **Freeform** | Click to place vertices, click near start or press ENTER to close, ESC to cancel |
 | **Regular** | Click to place regular polygons (3-120 sides) |
 | **Move Shape** | Select, move, rotate, scale, and manage shapes |
 | **Edit Shape** | Add, move, or delete individual vertices |
@@ -106,7 +214,7 @@ Hayai is designed for video projection mapping where the projector displays onto
 |-----|--------|
 | `SPACE` | Toggle UI visibility (play mode) |
 | `F11` | Toggle fullscreen |
-| `ESC` | Exit fullscreen |
+| `ESC` | Exit fullscreen / Cancel freeform shape |
 | `H` | Toggle hierarchy panel |
 | `I` | Toggle imagery panel |
 | `Ctrl+Z` | Undo |
@@ -204,7 +312,7 @@ The right-side panel adapts to your selection:
 - **Cursor** - Show/hide system cursor
 - **Crosshair** - Show/hide cursor crosshair overlay
 - **Grid** - Show/hide background grid
-- **Controls** - Show/hide the controls help panel
+- **Hints** - Show/hide the hints panel
 
 ### File Operations
 
@@ -220,26 +328,6 @@ The right-side panel adapts to your selection:
 | Images | PNG, JPG, JPEG, GIF (animated), BMP |
 | Video | MP4, AVI, MOV |
 | Projects | .hayai, .json |
-
-## Tips for Live Performance
-
-1. **Prepare your scene** ahead of time and save it
-2. **Use F11** to go fullscreen on your projector output
-3. **Press SPACE** to hide all UI elements during the show
-4. **Use groups** to move multiple shapes together
-5. **Animated GIFs and videos** loop automatically-great for dynamic content
-6. **Desktop capture** can display live content from other applications
-7. **Spout input** enables integration with VJ software like Resolume, TouchDesigner, etc.
-
-## Projection Mapping Workflow
-
-1. **Physical Setup**: Position your projector aimed at the target surface(s)
-2. **Create Shapes**: Trace the edges of physical surfaces with Freeform shapes, or use Regular shapes for geometric objects
-3. **Edit Shapes**: Add, remove, and move verts to refine shapes.
-4. **Load Content**: Add images or animations to each shape
-5. **Keystone Correction**: Use Edit Perspective Keystone corrections to match the perspective of each surface
-6. **Fine-Tune**: Adjust HSV and alpha for color matching
-7. **Perform**: Enter play mode (SPACE) and run your show
 
 ## Credits
 
