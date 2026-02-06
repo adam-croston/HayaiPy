@@ -29,7 +29,6 @@ except ImportError:
 
 try:
     from OpenGL.GL import *
-    from OpenGL.GLU import *
 except ImportError:
     import tkinter.messagebox as messagebox
     root = Tk()
@@ -87,7 +86,7 @@ GRID_COLOR = (50, 50, 50)
 SHAPE_OUTLINE_COLOR = (100, 200, 255)
 SELECTED_COLOR = (255, 200, 100)
 POINT_COLOR = (255, 100, 100)
-WARP_POINT_COLOR = (100, 255, 100)
+KEYSTONE_POINT_COLOR = (100, 255, 100)
 UI_BG = (45, 45, 50)
 UI_TEXT = (220, 220, 220)
 UI_HIGHLIGHT = (80, 140, 200)
@@ -449,6 +448,30 @@ void main() {
 }
 """
 
+# ---------------------------------------------------------------------------
+# UI overlay shaders (Core Profile compatible fullscreen textured quad)
+# ---------------------------------------------------------------------------
+UI_VERTEX_SHADER = """
+#version 330 core
+layout(location = 0) in vec2 aPos;
+layout(location = 1) in vec2 aTexCoord;
+out vec2 vTexCoord;
+void main() {
+    gl_Position = vec4(aPos, 0.0, 1.0);
+    vTexCoord = aTexCoord;
+}
+"""
+
+UI_FRAGMENT_SHADER = """
+#version 330 core
+in vec2 vTexCoord;
+uniform sampler2D uiTexture;
+out vec4 fragColor;
+void main() {
+    fragColor = texture(uiTexture, vTexCoord);
+}
+"""
+
 
 class GLRenderer:
     """OpenGL renderer for perspective-correct quad warping using shaders"""
@@ -474,6 +497,11 @@ class GLRenderer:
         self.u_hue_shift = -1
         self.u_sat_mult = -1
         self.u_val_mult = -1
+        # UI overlay resources
+        self.ui_shader_program = None
+        self.ui_vao = None
+        self.ui_vbo = None
+        self.ui_u_texture = -1
 
     def invalidate(self):
         """Invalidate all OpenGL objects - call when context is destroyed"""
@@ -482,6 +510,11 @@ class GLRenderer:
         self.vao = None
         self.vbo = None
         self.textures = {}
+        # Reset UI overlay resources
+        self.ui_shader_program = None
+        self.ui_vao = None
+        self.ui_vbo = None
+        self.ui_u_texture = -1
         # Reset all uniform locations to invalid
         for attr in ('u_screen_size', 'u_p0', 'u_p1', 'u_p2', 'u_p3', 'u_texture',
                       'u_perspective_x', 'u_perspective_y', 'u_shape_alpha',
@@ -560,12 +593,75 @@ class GLRenderer:
 
         glBindVertexArray(0)
 
+    def _create_ui_shader_program(self):
+        """Create shader program for rendering the UI overlay quad"""
+        vs = self._compile_shader(UI_VERTEX_SHADER, GL_VERTEX_SHADER)
+        fs = self._compile_shader(UI_FRAGMENT_SHADER, GL_FRAGMENT_SHADER)
+        if not vs or not fs:
+            raise RuntimeError("Failed to compile UI overlay shaders")
+
+        self.ui_shader_program = glCreateProgram()
+        glAttachShader(self.ui_shader_program, vs)
+        glAttachShader(self.ui_shader_program, fs)
+        glLinkProgram(self.ui_shader_program)
+
+        if not glGetProgramiv(self.ui_shader_program, GL_LINK_STATUS):
+            error = glGetProgramInfoLog(self.ui_shader_program).decode()
+            raise RuntimeError(f"UI shader linking error: {error}")
+
+        glDeleteShader(vs)
+        glDeleteShader(fs)
+
+        self.ui_u_texture = glGetUniformLocation(self.ui_shader_program, "uiTexture")
+
+    def _create_ui_quad_vao(self):
+        """Create a static fullscreen quad VAO for the UI overlay"""
+        # 6 vertices (2 triangles), each with 2D position + 2D texcoord
+        quad_data = (ctypes.c_float * 24)(
+            # Triangle 1
+            -1.0, -1.0,  0.0, 0.0,  # bottom-left
+             1.0, -1.0,  1.0, 0.0,  # bottom-right
+             1.0,  1.0,  1.0, 1.0,  # top-right
+            # Triangle 2
+            -1.0, -1.0,  0.0, 0.0,  # bottom-left
+             1.0,  1.0,  1.0, 1.0,  # top-right
+            -1.0,  1.0,  0.0, 1.0,  # top-left
+        )
+
+        self.ui_vao = glGenVertexArrays(1)
+        self.ui_vbo = glGenBuffers(1)
+
+        glBindVertexArray(self.ui_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self.ui_vbo)
+        glBufferData(GL_ARRAY_BUFFER, ctypes.sizeof(quad_data), quad_data, GL_STATIC_DRAW)
+
+        stride = 4 * 4  # 4 floats * 4 bytes
+        # Position attribute (location 0)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, stride, None)
+        # Texcoord attribute (location 1)
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(2 * 4))
+
+        glBindVertexArray(0)
+
+    def draw_ui_overlay(self, texture_id):
+        """Draw the UI surface as a fullscreen textured quad using shaders"""
+        glUseProgram(self.ui_shader_program)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, texture_id)
+        glUniform1i(self.ui_u_texture, 0)
+
+        glBindVertexArray(self.ui_vao)
+        glDrawArrays(GL_TRIANGLES, 0, 6)
+        glBindVertexArray(0)
+        glUseProgram(0)
+
     def init_gl(self, width, height):
         """Initialize OpenGL context with shaders"""
         self.screen_width = width
         self.screen_height = height
 
-        glEnable(GL_TEXTURE_2D)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
@@ -578,6 +674,10 @@ class GLRenderer:
 
             # Create VAO for shader-based rendering
             self._create_quad_vao()
+
+            # Create UI overlay shader and quad
+            self._create_ui_shader_program()
+            self._create_ui_quad_vao()
 
         self.initialized = True
 
@@ -678,7 +778,7 @@ class GLRenderer:
         glBindTexture(GL_TEXTURE_2D, texture_id)
         glUniform1i(self.u_texture, 0)
 
-        # Draw warp quad directly as 2 triangles: TL-TR-BR and TL-BR-BL
+        # Draw keystone quad directly as 2 triangles: TL-TR-BR and TL-BR-BL
         vertices = [
             p0[0], p0[1],  # TL
             p1[0], p1[1],  # TR
@@ -699,18 +799,18 @@ class GLRenderer:
         glBindVertexArray(0)
         glUseProgram(0)
 
-    def draw_textured_triangles(self, texture_id, triangles, warp_points, _tex_width, _tex_height,
+    def draw_textured_triangles(self, texture_id, triangles, keystone_points, _tex_width, _tex_height,
                                  perspective_x=0.0, perspective_y=0.0, alpha=1.0,
                                  hue_shift=0.0, saturation=1.0, color_value=1.0):
-        """Draw triangulated polygon with texture using warp points for UV calculation"""
+        """Draw triangulated polygon with texture using keystone points for UV calculation"""
         if not triangles:
             return
 
-        p0, p1, p2, p3 = warp_points  # TL, TR, BR, BL
+        p0, p1, p2, p3 = keystone_points  # TL, TR, BR, BL
 
         glUseProgram(self.shader_program)
 
-        # Set uniforms - same warp points for UV calculation
+        # Set uniforms - same keystone points for UV calculation
         glUniform2f(self.u_screen_size, self.screen_width, self.screen_height)
         glUniform2f(self.u_p0, p0[0], p0[1])
         glUniform2f(self.u_p1, p1[0], p1[1])
@@ -860,8 +960,8 @@ def triangulate_polygon(vertices):
 
 @dataclass
 class Shape:
-    contour: List[Tuple[float, float]] = field(default_factory=list)
-    warp_points: List[Tuple[float, float]] = field(default_factory=list)
+    stencil: List[Tuple[float, float]] = field(default_factory=list)
+    keystone_points: List[Tuple[float, float]] = field(default_factory=list)
     # Imagery reference (links to ImageryManager item)
     imagery_ref: Optional[str] = None  # ID of referenced ImageryItem
     frame_offset_percent: float = 0.0  # Animation sync offset (0-100%)
@@ -893,8 +993,8 @@ class Shape:
     _parent: Optional['Group'] = field(default=None, repr=False)
 
     def __post_init__(self):
-        if not self.warp_points and len(self.contour) >= 3:
-            self.fit_warp_to_contour()
+        if not self.keystone_points and len(self.stencil) >= 3:
+            self.fit_keystone_to_stencil()
 
     def get_current_image(self, imagery_manager: Optional['ImageryManager'] = None) -> Optional[pygame.Surface]:
         """
@@ -917,10 +1017,10 @@ class Shape:
         return None  # No imagery assigned - will use DEFAULT_PATTERN
 
     def get_bounds(self):
-        if not self.contour:
+        if not self.stencil:
             return (0, 0, 0, 0)
-        xs = [p[0] for p in self.contour]
-        ys = [p[1] for p in self.contour]
+        xs = [p[0] for p in self.stencil]
+        ys = [p[1] for p in self.stencil]
         return (min(xs), min(ys), max(xs), max(ys))
 
     def get_center(self):
@@ -929,11 +1029,11 @@ class Shape:
         return self.get_world_point(local_center[0], local_center[1])
 
     def _get_local_center(self):
-        """Get center of contour in local coordinates"""
-        if not self.contour:
+        """Get center of stencil in local coordinates"""
+        if not self.stencil:
             return (0, 0)
-        xs = [p[0] for p in self.contour]
-        ys = [p[1] for p in self.contour]
+        xs = [p[0] for p in self.stencil]
+        ys = [p[1] for p in self.stencil]
         return (sum(xs) / len(xs), sum(ys) / len(ys))
 
     def _get_pivot(self):
@@ -1004,13 +1104,13 @@ class Shape:
 
         return (world_x, world_y)
 
-    def get_world_contour(self):
-        """Get contour points in world coordinates"""
-        return [self.get_world_point(x, y) for x, y in self.contour]
+    def get_world_stencil(self):
+        """Get stencil points in world coordinates"""
+        return [self.get_world_point(x, y) for x, y in self.stencil]
 
-    def get_world_warp_points(self):
-        """Get warp points in world coordinates"""
-        return [self.get_world_point(x, y) for x, y in self.warp_points]
+    def get_world_keystone_points(self):
+        """Get keystone points in world coordinates"""
+        return [self.get_world_point(x, y) for x, y in self.keystone_points]
 
     def get_local_point(self, world_x, world_y):
         """Convert world point to local coordinates (inverse of get_world_point)"""
@@ -1083,20 +1183,20 @@ class Shape:
 
     def get_world_bounds(self):
         """Get bounding box in world coordinates"""
-        world_contour = self.get_world_contour()
-        if not world_contour:
+        world_stencil = self.get_world_stencil()
+        if not world_stencil:
             return (0, 0, 0, 0)
-        xs = [p[0] for p in world_contour]
-        ys = [p[1] for p in world_contour]
+        xs = [p[0] for p in world_stencil]
+        ys = [p[1] for p in world_stencil]
         return (min(xs), min(ys), max(xs), max(ys))
 
-    def fit_warp_to_contour(self):
-        # If shape has exactly 4 vertices, use them directly as warp points
-        if len(self.contour) == 4:
+    def fit_keystone_to_stencil(self):
+        # If shape has exactly 4 vertices, use them directly as keystone points
+        if len(self.stencil) == 4:
             # Sort vertices to determine TL, TR, BR, BL order
             # First, find the center
-            cx = sum(p[0] for p in self.contour) / 4
-            cy = sum(p[1] for p in self.contour) / 4
+            cx = sum(p[0] for p in self.stencil) / 4
+            cy = sum(p[1] for p in self.stencil) / 4
 
             # Categorize points by quadrant relative to center
             top_left = None
@@ -1104,7 +1204,7 @@ class Shape:
             bottom_right = None
             bottom_left = None
 
-            for p in self.contour:
+            for p in self.stencil:
                 if p[0] <= cx and p[1] <= cy:
                     top_left = p
                 elif p[0] > cx and p[1] <= cy:
@@ -1114,16 +1214,16 @@ class Shape:
                 else:
                     bottom_left = p
 
-            # If all corners found, use them; otherwise fall back to contour order
+            # If all corners found, use them; otherwise fall back to stencil order
             if top_left and top_right and bottom_right and bottom_left:
-                self.warp_points = [top_left, top_right, bottom_right, bottom_left]
+                self.keystone_points = [top_left, top_right, bottom_right, bottom_left]
             else:
-                # Use contour order directly (assume user drew in correct order)
-                self.warp_points = list(self.contour)
+                # Use stencil order directly (assume user drew in correct order)
+                self.keystone_points = list(self.stencil)
         else:
             # For shapes with more or fewer than 4 verts, use bounding box
             bounds = self.get_bounds()
-            self.warp_points = [
+            self.keystone_points = [
                 (bounds[0], bounds[1]),  # top-left
                 (bounds[2], bounds[1]),  # top-right
                 (bounds[2], bounds[3]),  # bottom-right
@@ -1132,17 +1232,17 @@ class Shape:
 
     def contains_point(self, point):
         """Test if point is inside shape using world coordinates"""
-        if len(self.contour) < 3:
+        if len(self.stencil) < 3:
             return False
         # Use world coordinates for hit testing
-        world_contour = self.get_world_contour()
+        world_stencil = self.get_world_stencil()
         x, y = point
-        n = len(world_contour)
+        n = len(world_stencil)
         inside = False
         j = n - 1
         for i in range(n):
-            xi, yi = world_contour[i]
-            xj, yj = world_contour[j]
+            xi, yi = world_stencil[i]
+            xj, yj = world_stencil[j]
             if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi) + xi):
                 inside = not inside
             j = i
@@ -1152,14 +1252,14 @@ class Shape:
         """Move shape by updating position offset"""
         self.position = (self.position[0] + dx, self.position[1] + dy)
 
-    def normalize_warp_points(self):
-        """Reorder warp points to ensure TL, TR, BR, BL order based on actual positions"""
-        if len(self.warp_points) != 4:
+    def normalize_keystone_points(self):
+        """Reorder keystone points to ensure TL, TR, BR, BL order based on actual positions"""
+        if len(self.keystone_points) != 4:
             return
 
-        # Find center of warp quad
-        cx = sum(p[0] for p in self.warp_points) / 4
-        cy = sum(p[1] for p in self.warp_points) / 4
+        # Find center of keystone quad
+        cx = sum(p[0] for p in self.keystone_points) / 4
+        cy = sum(p[1] for p in self.keystone_points) / 4
 
         # Categorize points by quadrant
         top_left = None
@@ -1167,7 +1267,7 @@ class Shape:
         bottom_right = None
         bottom_left = None
 
-        for p in self.warp_points:
+        for p in self.keystone_points:
             if p[0] <= cx and p[1] <= cy:
                 top_left = p
             elif p[0] > cx and p[1] <= cy:
@@ -1179,9 +1279,9 @@ class Shape:
 
         # Only reorder if all corners found
         if top_left and top_right and bottom_right and bottom_left:
-            self.warp_points = [top_left, top_right, bottom_right, bottom_left]
+            self.keystone_points = [top_left, top_right, bottom_right, bottom_left]
 
-    def rotate(self, clockwise=True, degrees=90, warp_only=False):
+    def rotate(self, clockwise=True, degrees=90, keystone_only=False):
         """Rotate shape by updating rotation angle"""
         delta = -degrees if clockwise else degrees
         self.rotation = (self.rotation + delta) % 360
@@ -1190,46 +1290,50 @@ class Shape:
         """Set uniform scale factor"""
         self.scale = max(0.01, min(10.0, scale))  # Clamp between 0.01 and 10.0
 
-    def flip_x(self, warp_only=False):
+    def flip_x(self, keystone_only=False, stencil_only=False):
         """Flip horizontally by modifying local coordinates"""
         cx, _ = self._get_local_center()
-        if not warp_only:
-            self.contour = [(2 * cx - x, y) for x, y in self.contour]
-        self.warp_points = [(2 * cx - x, y) for x, y in self.warp_points]
+        if not keystone_only:
+            self.stencil = [(2 * cx - x, y) for x, y in self.stencil]
+        if not stencil_only:
+            self.keystone_points = [(2 * cx - x, y) for x, y in self.keystone_points]
 
-    def flip_y(self, warp_only=False):
+    def flip_y(self, keystone_only=False, stencil_only=False):
         """Flip vertically by modifying local coordinates"""
         _, cy = self._get_local_center()
-        if not warp_only:
-            self.contour = [(x, 2 * cy - y) for x, y in self.contour]
-        self.warp_points = [(x, 2 * cy - y) for x, y in self.warp_points]
+        if not keystone_only:
+            self.stencil = [(x, 2 * cy - y) for x, y in self.stencil]
+        if not stencil_only:
+            self.keystone_points = [(x, 2 * cy - y) for x, y in self.keystone_points]
 
-    def flip_x_global(self, pivot: Tuple[float, float], warp_only=False):
+    def flip_x_global(self, pivot: Tuple[float, float], keystone_only=False, stencil_only=False):
         """Flip horizontally about global X axis through pivot point"""
         def flip_point(px: float, py: float) -> Tuple[float, float]:
             world_x, world_y = self.get_world_point(px, py)
             new_world_x = 2 * pivot[0] - world_x
             return self.get_local_point(new_world_x, world_y)
 
-        if not warp_only:
-            self.contour = [flip_point(x, y) for x, y in self.contour]
-        self.warp_points = [flip_point(x, y) for x, y in self.warp_points]
+        if not keystone_only:
+            self.stencil = [flip_point(x, y) for x, y in self.stencil]
+        if not stencil_only:
+            self.keystone_points = [flip_point(x, y) for x, y in self.keystone_points]
 
-    def flip_y_global(self, pivot: Tuple[float, float], warp_only=False):
+    def flip_y_global(self, pivot: Tuple[float, float], keystone_only=False, stencil_only=False):
         """Flip vertically about global Y axis through pivot point"""
         def flip_point(px: float, py: float) -> Tuple[float, float]:
             world_x, world_y = self.get_world_point(px, py)
             new_world_y = 2 * pivot[1] - world_y
             return self.get_local_point(world_x, new_world_y)
 
-        if not warp_only:
-            self.contour = [flip_point(x, y) for x, y in self.contour]
-        self.warp_points = [flip_point(x, y) for x, y in self.warp_points]
+        if not keystone_only:
+            self.stencil = [flip_point(x, y) for x, y in self.stencil]
+        if not stencil_only:
+            self.keystone_points = [flip_point(x, y) for x, y in self.keystone_points]
 
     def scale_geometry(self, scale_x: float, scale_y: float,
                        pivot: Tuple[float, float]) -> None:
         """
-        Scale the shape's geometry (contour and warp points) around a pivot point.
+        Scale the shape's geometry (stencil and keystone points) around a pivot point.
         This is a permanent deformation - modifies the actual coordinates.
 
         Args:
@@ -1247,11 +1351,11 @@ class Shape:
             # Convert back to local coordinates
             return self.get_local_point(new_world_x, new_world_y)
 
-        # Scale contour points
-        self.contour = [scale_point(x, y) for x, y in self.contour]
+        # Scale stencil points
+        self.stencil = [scale_point(x, y) for x, y in self.stencil]
 
-        # Scale warp points
-        self.warp_points = [scale_point(x, y) for x, y in self.warp_points]
+        # Scale keystone points
+        self.keystone_points = [scale_point(x, y) for x, y in self.keystone_points]
 
     def load_image(self, path):
         """Load image or animation from path. Returns error message string or None on success."""
@@ -1351,8 +1455,8 @@ class Shape:
 
     def to_dict(self):
         return {
-            'contour': self.contour,
-            'warp_points': self.warp_points,
+            'stencil': self.stencil,
+            'keystone_points': self.keystone_points,
             # Imagery reference
             'imagery_ref': self.imagery_ref,
             'frame_offset_percent': self.frame_offset_percent,
@@ -1379,8 +1483,8 @@ class Shape:
     @classmethod
     def from_dict(cls, data):
         shape = cls(
-            contour=[tuple(p) for p in data.get('contour', [])],
-            warp_points=[tuple(p) for p in data.get('warp_points', [])],
+            stencil=[tuple(p) for p in data.get('stencil', [])],
+            keystone_points=[tuple(p) for p in data.get('keystone_points', [])],
             # Imagery reference
             imagery_ref=data.get('imagery_ref'),
             frame_offset_percent=data.get('frame_offset_percent', 0.0),
@@ -1589,21 +1693,21 @@ class Group:
             new_y = cy + dx * sin_a + dy * cos_a
             self.position = (new_x, new_y)
 
-    def flip_x(self, center: Tuple[float, float], warp_only: bool = False) -> None:
+    def flip_x(self, center: Tuple[float, float], keystone_only: bool = False, stencil_only: bool = False) -> None:
         """
         Flip the group horizontally around a center point.
         Flips all child shapes around the center point.
         """
         for shape in self.get_all_shapes():
-            shape.flip_x_global(center, warp_only=warp_only)
+            shape.flip_x_global(center, keystone_only=keystone_only, stencil_only=stencil_only)
 
-    def flip_y(self, center: Tuple[float, float], warp_only: bool = False) -> None:
+    def flip_y(self, center: Tuple[float, float], keystone_only: bool = False, stencil_only: bool = False) -> None:
         """
         Flip the group vertically around a center point.
         Flips all child shapes around the center point.
         """
         for shape in self.get_all_shapes():
-            shape.flip_y_global(center, warp_only=warp_only)
+            shape.flip_y_global(center, keystone_only=keystone_only, stencil_only=stencil_only)
 
     def to_dict(self) -> dict:
         """Serialize group to dictionary."""
@@ -4780,8 +4884,11 @@ class ImageryPanel:
             return True
 
         # Handle DELETE key for selected imagery item
+        # Don't intercept if user is deleting a vertex in stencil edit mode
         if (event.type == pygame.KEYDOWN and event.key == pygame.K_DELETE
-                and not self.collapsed and self.selected_item):
+                and not self.collapsed and self.selected_item
+                and not (self.app.mode == self.app.MODE_EDIT_STENCIL
+                         and self.app.selected_vertex is not None)):
             self._delete_selected()
             return True
 
@@ -5360,8 +5467,8 @@ class Hayai:
     # Modes
     MODE_MAKE_SHAPE = 0
     MODE_MOVE_SHAPE = 1
-    MODE_EDIT_SHAPE = 2
-    MODE_EDIT_WARP = 3
+    MODE_EDIT_STENCIL = 2
+    MODE_EDIT_KEYSTONE = 3
 
     def __init__(self, width: int = None, height: int = None):
         global WIDTH, HEIGHT
@@ -5376,7 +5483,10 @@ class Hayai:
         desktop_sizes = pygame.display.get_desktop_sizes()
         self.native_resolution = desktop_sizes[0] if desktop_sizes else (1920, 1080)
 
-        # OpenGL mode - use OPENGL | DOUBLEBUF flags
+        # OpenGL mode - request 3.3 Core Profile (required on macOS for GLSL 330)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
         pygame.display.gl_set_attribute(pygame.GL_STENCIL_SIZE, 8)
         self.screen = pygame.display.set_mode((init_width, init_height),
                                                pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
@@ -5394,7 +5504,7 @@ class Hayai:
         self.clock = pygame.time.Clock()
         self.running = True
         self.play_mode = False
-        self.show_mask = True
+        self.show_stencil = True
         self.show_geom = True
         self.show_crosshair = True  # Crosshair toggle (on by default)
         self.show_cursor = True  # System cursor visibility
@@ -5431,7 +5541,7 @@ class Hayai:
         self.selected_items: List[SceneItem] = []  # Multi-selection support
         self.shapes: List[Shape] = []  # Flat list for backward compat (auto-generated)
         self.selected_shape: Optional[Shape] = None  # Primary selection (first selected shape)
-        self.current_contour: List[Tuple[float, float]] = []
+        self.current_stencil: List[Tuple[float, float]] = []
 
         # Hierarchy panel state (panel itself manages collapsed/expanded state)
         self.hierarchy_panel_width = 250  # Current panel width
@@ -5444,8 +5554,8 @@ class Hayai:
         self.mode = self.MODE_MOVE_SHAPE
         self.dragging = False
         self.drag_start = None
-        self.dragging_warp_point = None
-        self.dragging_vertex = None  # Index of vertex being dragged in edit shape mode
+        self.dragging_keystone_point = None
+        self.dragging_vertex = None  # Index of vertex being dragged in edit stencil mode
         self.drag_start_world = None  # World position at drag start (for delta-based dragging)
         self.drag_start_local = None  # Local position at drag start (for delta-based dragging)
         self.hover_vertex = None  # Index of vertex being hovered
@@ -5469,10 +5579,10 @@ class Hayai:
         self.rotate_start_center: Optional[Tuple[float, float]] = None  # Center of rotation
         self.rotation_pivot_for_ui: Optional[Tuple[float, float]] = None  # Fixed pivot point for UI rendering during rotation
 
-        # Warp rotation state (Edit Warp mode)
-        self.rotating_warp = False
-        self.warp_rotate_start_angle = 0.0
-        self.warp_rotate_center: Optional[Tuple[float, float]] = None
+        # Keystone rotation state (Edit Keystone mode)
+        self.rotating_keystone = False
+        self.keystone_rotate_start_angle = 0.0
+        self.keystone_rotate_center: Optional[Tuple[float, float]] = None
 
         # Marquee selection state
         self.marquee_start: Optional[Tuple[float, float]] = None  # Start point (base coords)
@@ -5605,12 +5715,16 @@ class Hayai:
                 self.btn_create_freeform.active = True
         elif self.mode == self.MODE_MOVE_SHAPE:
             self.btn_move_shape.active = True
-        elif self.mode == self.MODE_EDIT_SHAPE:
-            self.btn_edit_shape.active = True
-            self.btn_flip_x.disabled = False
-            self.btn_flip_y.disabled = False
-        elif self.mode == self.MODE_EDIT_WARP:
-            self.btn_edit_warp.active = True
+            self.btn_move_flip_x.disabled = False
+            self.btn_move_flip_y.disabled = False
+        elif self.mode == self.MODE_EDIT_STENCIL:
+            self.btn_edit_stencil.active = True
+            self.btn_stencil_flip_x.disabled = False
+            self.btn_stencil_flip_y.disabled = False
+        elif self.mode == self.MODE_EDIT_KEYSTONE:
+            self.btn_edit_keystone.active = True
+            self.btn_keystone_flip_x.disabled = False
+            self.btn_keystone_flip_y.disabled = False
 
     def generate_shape_name(self):
         """Generate a unique name for a new shape"""
@@ -6312,7 +6426,7 @@ class Hayai:
 
         self.btn_create_freeform = Button(create_x, create_y, create_btn_w, btn_h, "Freeform",
                                           self.start_poly_mode,
-                                          tooltip="Draw custom polygon")
+                                          tooltip="Draw custom stencil")
         self.btn_create_freeform._panel_offset_x = self.btn_create_freeform.rect.x - tools_panel_x
         self.btn_create_freeform._panel_offset_y = self.btn_create_freeform.rect.y - tools_panel_y
         self.buttons.append(self.btn_create_freeform)
@@ -6320,7 +6434,7 @@ class Hayai:
         create_x += create_btn_w + gap
         self.btn_create_regular = Button(create_x, create_y, create_btn_w, btn_h, "Regular",
                                          self.start_regular_placement,
-                                         tooltip="Place regular polygon")
+                                         tooltip="Place regular stencil")
         self.btn_create_regular._panel_offset_x = self.btn_create_regular.rect.x - tools_panel_x
         self.btn_create_regular._panel_offset_y = self.btn_create_regular.rect.y - tools_panel_y
         self.buttons.append(self.btn_create_regular)
@@ -6349,7 +6463,7 @@ class Hayai:
         self.btn_on_corner.disabled = True
 
         # ===== CENTER TOP ROW 2: MODE buttons =====
-        # Mode buttons: Modify Shape, Move Shape, Edit Keystone (centered below creation row + "Edit" subtitle)
+        # Mode buttons: Move Shape, Modify Shape, Edit Keystone (centered below creation row + "Edit" subtitle)
         mode_btn_count = 3
         mode_total_width = mode_btn_count * btn_w + (mode_btn_count - 1) * gap
         mode_x = (WIDTH - mode_total_width) // 2
@@ -6357,17 +6471,7 @@ class Hayai:
         self._tp_edit_subtitle_offset_y = (panel_header_height + subtitle_height + btn_h + gap + self.section_gap)
         mode_y = tools_panel_y + self._tp_edit_subtitle_offset_y + subtitle_height
 
-        # Position 1: Modify Shape (formerly Edit Shape)
-        modify_shape_x = mode_x
-        self.btn_edit_shape = Button(mode_x, mode_y, btn_w, btn_h, "Modify Shape",
-                                     lambda: self.set_mode(self.MODE_EDIT_SHAPE),
-                                     tooltip="Add, move, or delete polygon vertices")
-        self.btn_edit_shape._panel_offset_x = self.btn_edit_shape.rect.x - tools_panel_x
-        self.btn_edit_shape._panel_offset_y = self.btn_edit_shape.rect.y - tools_panel_y
-        self.buttons.append(self.btn_edit_shape)
-
-        mode_x += btn_w + gap
-        # Position 2: Move Shape - store position for sub-buttons (fx/fy)
+        # Position 1: Move Shape - capture x for sub-buttons
         move_shape_x = mode_x
         self.btn_move_shape = Button(mode_x, mode_y, btn_w, btn_h, "Move Shape",
                                      lambda: self.set_mode(self.MODE_MOVE_SHAPE),
@@ -6377,39 +6481,79 @@ class Hayai:
         self.buttons.append(self.btn_move_shape)
 
         mode_x += btn_w + gap
-        # Position 3: Edit Keystone (formerly Edit Warp)
+        # Position 2: Modify Stencil (formerly Edit Shape) - store position for sub-buttons (fx/fy)
+        modify_shape_x = mode_x
+        self.btn_edit_stencil = Button(mode_x, mode_y, btn_w, btn_h, "Modify Stencil",
+                                     lambda: self.set_mode(self.MODE_EDIT_STENCIL),
+                                     tooltip="Add, move, or delete stencil vertices")
+        self.btn_edit_stencil._panel_offset_x = self.btn_edit_stencil.rect.x - tools_panel_x
+        self.btn_edit_stencil._panel_offset_y = self.btn_edit_stencil.rect.y - tools_panel_y
+        self.buttons.append(self.btn_edit_stencil)
+
+        mode_x += btn_w + gap
+        # Position 3: Edit Keystone
         edit_keystone_x = mode_x
-        self.btn_edit_warp = Button(mode_x, mode_y, btn_w, btn_h, "Edit Keystone",
-                                    lambda: self.set_mode(self.MODE_EDIT_WARP),
-                                    tooltip="Adjust perspective and visual properties")
-        self.btn_edit_warp._panel_offset_x = self.btn_edit_warp.rect.x - tools_panel_x
-        self.btn_edit_warp._panel_offset_y = self.btn_edit_warp.rect.y - tools_panel_y
-        self.buttons.append(self.btn_edit_warp)
+        self.btn_edit_keystone = Button(mode_x, mode_y, btn_w, btn_h, "Edit Keystone",
+                                    lambda: self.set_mode(self.MODE_EDIT_KEYSTONE),
+                                    tooltip="Adjust keystone and visual properties")
+        self.btn_edit_keystone._panel_offset_x = self.btn_edit_keystone.rect.x - tools_panel_x
+        self.btn_edit_keystone._panel_offset_y = self.btn_edit_keystone.rect.y - tools_panel_y
+        self.buttons.append(self.btn_edit_keystone)
 
         # ===== SUB-BUTTONS UNDER MODE BUTTONS =====
         sub_btn_y = mode_y + btn_h + gap
         half_w = (btn_w - gap) // 2
 
-        # FlipX/FlipY under Modify Shape (position 1)
-        self.btn_flip_x = Button(modify_shape_x, sub_btn_y, half_w, btn_h, "FlipX", self.flip_x,
-                                 tooltip="Flip Horizontal")
-        self.btn_flip_x.disabled = True  # Initially disabled
-        self.btn_flip_x._panel_offset_x = self.btn_flip_x.rect.x - tools_panel_x
-        self.btn_flip_x._panel_offset_y = self.btn_flip_x.rect.y - tools_panel_y
-        self.buttons.append(self.btn_flip_x)
-        self.btn_flip_y = Button(modify_shape_x + half_w + gap, sub_btn_y, half_w, btn_h, "FlipY", self.flip_y,
-                                 tooltip="Flip Vertical")
-        self.btn_flip_y.disabled = True
-        self.btn_flip_y._panel_offset_x = self.btn_flip_y.rect.x - tools_panel_x
-        self.btn_flip_y._panel_offset_y = self.btn_flip_y.rect.y - tools_panel_y
-        self.buttons.append(self.btn_flip_y)
+        # FlipX/FlipY under Move Shape
+        self.btn_move_flip_x = Button(move_shape_x, sub_btn_y, half_w, btn_h, "FlipX", self.flip_shape_x,
+                                      tooltip="Flip stencil + keystone horizontally")
+        self.btn_move_flip_x.disabled = True
+        self.btn_move_flip_x._panel_offset_x = self.btn_move_flip_x.rect.x - tools_panel_x
+        self.btn_move_flip_x._panel_offset_y = self.btn_move_flip_x.rect.y - tools_panel_y
+        self.buttons.append(self.btn_move_flip_x)
+        self.btn_move_flip_y = Button(move_shape_x + half_w + gap, sub_btn_y, half_w, btn_h, "FlipY", self.flip_shape_y,
+                                      tooltip="Flip stencil + keystone vertically")
+        self.btn_move_flip_y.disabled = True
+        self.btn_move_flip_y._panel_offset_x = self.btn_move_flip_y.rect.x - tools_panel_x
+        self.btn_move_flip_y._panel_offset_y = self.btn_move_flip_y.rect.y - tools_panel_y
+        self.buttons.append(self.btn_move_flip_y)
+
+        # FlipX/FlipY under Modify Stencil
+        self.btn_stencil_flip_x = Button(modify_shape_x, sub_btn_y, half_w, btn_h, "FlipX", self.flip_stencil_x,
+                                         tooltip="Flip stencil only horizontally")
+        self.btn_stencil_flip_x.disabled = True
+        self.btn_stencil_flip_x._panel_offset_x = self.btn_stencil_flip_x.rect.x - tools_panel_x
+        self.btn_stencil_flip_x._panel_offset_y = self.btn_stencil_flip_x.rect.y - tools_panel_y
+        self.buttons.append(self.btn_stencil_flip_x)
+        self.btn_stencil_flip_y = Button(modify_shape_x + half_w + gap, sub_btn_y, half_w, btn_h, "FlipY", self.flip_stencil_y,
+                                         tooltip="Flip stencil only vertically")
+        self.btn_stencil_flip_y.disabled = True
+        self.btn_stencil_flip_y._panel_offset_x = self.btn_stencil_flip_y.rect.x - tools_panel_x
+        self.btn_stencil_flip_y._panel_offset_y = self.btn_stencil_flip_y.rect.y - tools_panel_y
+        self.buttons.append(self.btn_stencil_flip_y)
+
+        # FlipX/FlipY under Edit Keystone
+        self.btn_keystone_flip_x = Button(edit_keystone_x, sub_btn_y, half_w, btn_h, "FlipX", self.flip_keystone_x,
+                                          tooltip="Flip keystone only horizontally")
+        self.btn_keystone_flip_x.disabled = True
+        self.btn_keystone_flip_x._panel_offset_x = self.btn_keystone_flip_x.rect.x - tools_panel_x
+        self.btn_keystone_flip_x._panel_offset_y = self.btn_keystone_flip_x.rect.y - tools_panel_y
+        self.buttons.append(self.btn_keystone_flip_x)
+        self.btn_keystone_flip_y = Button(edit_keystone_x + half_w + gap, sub_btn_y, half_w, btn_h, "FlipY", self.flip_keystone_y,
+                                          tooltip="Flip keystone only vertically")
+        self.btn_keystone_flip_y.disabled = True
+        self.btn_keystone_flip_y._panel_offset_x = self.btn_keystone_flip_y.rect.x - tools_panel_x
+        self.btn_keystone_flip_y._panel_offset_y = self.btn_keystone_flip_y.rect.y - tools_panel_y
+        self.buttons.append(self.btn_keystone_flip_y)
 
         # Collect tools panel buttons and compute content height
         self.tools_panel_buttons = [
             self.btn_create_freeform, self.btn_create_regular,
-            self.btn_on_corner, self.btn_edit_shape,
-            self.btn_move_shape, self.btn_edit_warp,
-            self.btn_flip_x, self.btn_flip_y
+            self.btn_on_corner, self.btn_edit_stencil,
+            self.btn_move_shape, self.btn_edit_keystone,
+            self.btn_move_flip_x, self.btn_move_flip_y,
+            self.btn_stencil_flip_x, self.btn_stencil_flip_y,
+            self.btn_keystone_flip_x, self.btn_keystone_flip_y
         ]
         tools_panel_height = int(179 * self.ui_scale)
         self.tools_content_height = tools_panel_height - self.tools_header_height
@@ -6431,13 +6575,13 @@ class Hayai:
         self.btn_geometry_toggle._panel_offset_y = dp_content_y
         self.buttons.append(self.btn_geometry_toggle)
 
-        self.btn_mask_toggle = Button(0, 0, btn_w, btn_h,
-                                      "Mask: ON" if self.show_mask else "Mask: OFF",
-                                      self.toggle_mask, tooltip="Toggle shape masking")
-        self.btn_mask_toggle.active = not self.show_mask
-        self.btn_mask_toggle._panel_offset_x = dp_content_x
-        self.btn_mask_toggle._panel_offset_y = dp_content_y + dp_row_step
-        self.buttons.append(self.btn_mask_toggle)
+        self.btn_stencil_toggle = Button(0, 0, btn_w, btn_h,
+                                      "Stencil: ON" if self.show_stencil else "Stencil: OFF",
+                                      self.toggle_stencil, tooltip="Toggle stencil visibility")
+        self.btn_stencil_toggle.active = not self.show_stencil
+        self.btn_stencil_toggle._panel_offset_x = dp_content_x
+        self.btn_stencil_toggle._panel_offset_y = dp_content_y + dp_row_step
+        self.buttons.append(self.btn_stencil_toggle)
 
         self.btn_cursor_toggle = Button(0, 0, btn_w, btn_h,
                                         "Cursor: ON" if self.show_cursor else "Cursor: OFF",
@@ -6473,7 +6617,7 @@ class Hayai:
 
         # Collect display panel buttons for per-frame repositioning
         self.display_panel_buttons = [
-            self.btn_geometry_toggle, self.btn_mask_toggle,
+            self.btn_geometry_toggle, self.btn_stencil_toggle,
             self.btn_cursor_toggle, self.btn_crosshair_toggle,
             self.btn_grid_toggle, self.btn_hit_area_viz
         ]
@@ -6515,10 +6659,24 @@ class Hayai:
         self.name_input._panel_offset_x = padding
         self.name_input._panel_offset_y = y_rel
 
-        # ===== IMAGERY SOURCE SECTION =====
+        # ===== STENCIL SECTION =====
         y_rel += row_spacing + self.section_gap
-        self._pp_source_section_offset_y = y_rel  # Relative offset for section header
+        self._pp_stencil_section_offset_y = y_rel  # Relative offset for section header
         y_rel += int(20 * self.ui_scale)  # Space for section header
+        self._pp_stencil_info_offset_y = y_rel  # Start of stencil info text
+        y_rel += int(54 * self.ui_scale)  # 3 lines of text (~18px each): Verts + Min + Max
+
+        # ===== IMAGERY SECTION =====
+        y_rel += self.section_gap
+        self._pp_imagery_section_offset_y = y_rel  # Relative offset for section header
+        y_rel += int(20 * self.ui_scale)  # Space for section header
+        self._pp_source_label_offset_y = y_rel  # Clickable source label
+        y_rel += int(20 * self.ui_scale)
+        self._pp_modifiers_label_offset_y = y_rel  # "Modifiers" sub-label
+        y_rel += int(18 * self.ui_scale)
+
+        # Clickable source label rect (set during draw)
+        self._pp_source_label_rect = None
 
         # Frame offset slider (for animation sync)
         self.frame_offset_slider = Slider(0, 0, slider_width, slider_height,
@@ -6558,14 +6716,14 @@ class Hayai:
         self._pp_keystone_section_offset_y = y_rel  # Relative offset for section header
         y_rel += int(20 * self.ui_scale)  # Space for section header
 
-        # Fit To Shape button in properties panel (not in main buttons list - handled separately)
+        # Fit To Stencil button in properties panel (not in main buttons list - handled separately)
         btn_h = int(28 * self.ui_scale)
-        self.btn_fit_warp = Button(0, 0, slider_width, btn_h,
-                                   "Fit To Shape", self.fit_warp,
-                                   tooltip="Reset warp corners to shape bounds")
-        self.btn_fit_warp.disabled = True
-        self.btn_fit_warp._panel_offset_x = padding
-        self.btn_fit_warp._panel_offset_y = y_rel
+        self.btn_fit_keystone = Button(0, 0, slider_width, btn_h,
+                                   "Fit To Stencil", self.fit_keystone,
+                                   tooltip="Reset keystone corners to stencil bounds")
+        self.btn_fit_keystone.disabled = True
+        self.btn_fit_keystone._panel_offset_x = padding
+        self.btn_fit_keystone._panel_offset_y = y_rel
 
         y_rel += btn_h + int(8 * self.ui_scale)
         self.persp_x_slider = Slider(0, 0, slider_width, slider_height,
@@ -6736,7 +6894,7 @@ class Hayai:
 
     def set_mode(self, mode):
         self.mode = mode
-        self.current_contour = []
+        self.current_stencil = []
         self.hover_vertex = None
         self.hover_edge = None
         self.dragging_vertex = None
@@ -6745,8 +6903,8 @@ class Hayai:
         self.pending_shape_type = None
         # Update mode button states
         self.btn_move_shape.active = (mode == self.MODE_MOVE_SHAPE)
-        self.btn_edit_shape.active = (mode == self.MODE_EDIT_SHAPE)
-        self.btn_edit_warp.active = (mode == self.MODE_EDIT_WARP)
+        self.btn_edit_stencil.active = (mode == self.MODE_EDIT_STENCIL)
+        self.btn_edit_keystone.active = (mode == self.MODE_EDIT_KEYSTONE)
         # Clear create buttons when switching to non-make modes
         self.btn_create_freeform.active = False
         self.btn_create_regular.active = False
@@ -6754,8 +6912,12 @@ class Hayai:
         self.sides_entry.disabled = True
         self.btn_on_corner.disabled = True
         # Update sub-button disabled states based on mode
-        self.btn_flip_x.disabled = (mode != self.MODE_EDIT_SHAPE)
-        self.btn_flip_y.disabled = (mode != self.MODE_EDIT_SHAPE)
+        self.btn_move_flip_x.disabled = (mode != self.MODE_MOVE_SHAPE)
+        self.btn_move_flip_y.disabled = (mode != self.MODE_MOVE_SHAPE)
+        self.btn_stencil_flip_x.disabled = (mode != self.MODE_EDIT_STENCIL)
+        self.btn_stencil_flip_y.disabled = (mode != self.MODE_EDIT_STENCIL)
+        self.btn_keystone_flip_x.disabled = (mode != self.MODE_EDIT_KEYSTONE)
+        self.btn_keystone_flip_y.disabled = (mode != self.MODE_EDIT_KEYSTONE)
         # Update contextual button states (includes Image/Fit buttons)
         self.update_mode_button_states()
 
@@ -6766,7 +6928,7 @@ class Hayai:
 
         # Check if freeform creation is in progress (unclosed)
         freeform_in_progress = (self.mode == self.MODE_MAKE_SHAPE and
-                                len(self.current_contour) > 0)
+                                len(self.current_stencil) > 0)
 
         # Move Shape: disabled if no shapes OR freeform in progress
         self.btn_move_shape.disabled = not has_shapes or freeform_in_progress
@@ -6774,12 +6936,12 @@ class Hayai:
         # Check if a closed shape is selected
         has_selected_shape = self.selected_shape is not None
 
-        # Edit Shape/Warp: disabled if no shape selected
-        self.btn_edit_shape.disabled = not has_selected_shape
-        self.btn_edit_warp.disabled = not has_selected_shape
+        # Edit Stencil/Keystone: disabled if no shape selected
+        self.btn_edit_stencil.disabled = not has_selected_shape
+        self.btn_edit_keystone.disabled = not has_selected_shape
 
-        # Fit To Shape: enabled when a shape is selected
-        self.btn_fit_warp.disabled = not has_selected_shape
+        # Fit To Stencil: enabled when a shape is selected
+        self.btn_fit_keystone.disabled = not has_selected_shape
 
     def _sync_display_toggle_button(self, button, label: str, state: bool):
         """Helper to sync a display toggle button's text and active state."""
@@ -6789,7 +6951,7 @@ class Hayai:
     def sync_all_display_toggles(self):
         """Sync all display toggle buttons with their current state values."""
         self._sync_display_toggle_button(self.btn_geometry_toggle, "Geom", self.show_geom)
-        self._sync_display_toggle_button(self.btn_mask_toggle, "Mask", self.show_mask)
+        self._sync_display_toggle_button(self.btn_stencil_toggle, "Stencil", self.show_stencil)
         self._sync_display_toggle_button(self.btn_crosshair_toggle, "Cross", self.show_crosshair)
         self._sync_display_toggle_button(self.btn_cursor_toggle, "Cursor", self.show_cursor)
         self._sync_display_toggle_button(self.btn_grid_toggle, "Grid", self.show_grid)
@@ -6803,8 +6965,8 @@ class Hayai:
     def toggle_geometry(self):
         self._toggle_display('show_geom', self.btn_geometry_toggle, "Geom")
 
-    def toggle_mask(self):
-        self._toggle_display('show_mask', self.btn_mask_toggle, "Mask")
+    def toggle_stencil(self):
+        self._toggle_display('show_stencil', self.btn_stencil_toggle, "Stencil")
 
     def toggle_crosshair(self):
         self._toggle_display('show_crosshair', self.btn_crosshair_toggle, "Cross")
@@ -6866,11 +7028,11 @@ class Hayai:
         self.pending_shape_type = "regular"
         self.placing_shape = True
         self.mode = self.MODE_MAKE_SHAPE
-        self.current_contour = []  # Clear any partial freeform polygon
+        self.current_stencil = []  # Clear any partial freeform polygon
         # Update button states
         self.btn_move_shape.active = False
-        self.btn_edit_shape.active = False
-        self.btn_edit_warp.active = False
+        self.btn_edit_stencil.active = False
+        self.btn_edit_keystone.active = False
         self.btn_create_freeform.active = False
         self.btn_create_regular.active = True
         # Enable sides/corner controls in regular mode
@@ -6884,11 +7046,11 @@ class Hayai:
         self.pending_shape_type = None
         self.placing_shape = False
         self.mode = self.MODE_MAKE_SHAPE
-        self.current_contour = []
+        self.current_stencil = []
         # Update button states
         self.btn_move_shape.active = False
-        self.btn_edit_shape.active = False
-        self.btn_edit_warp.active = False
+        self.btn_edit_stencil.active = False
+        self.btn_edit_keystone.active = False
         self.btn_create_freeform.active = True
         self.btn_create_regular.active = False
         # Disable sides/corner controls in freeform mode
@@ -6950,12 +7112,16 @@ class Hayai:
             self.btn_create_freeform.active = False
             self.btn_create_regular.active = False
             self.btn_move_shape.active = (self.mode == self.MODE_MOVE_SHAPE)
-            self.btn_edit_shape.active = (self.mode == self.MODE_EDIT_SHAPE)
-            self.btn_edit_warp.active = (self.mode == self.MODE_EDIT_WARP)
+            self.btn_edit_stencil.active = (self.mode == self.MODE_EDIT_STENCIL)
+            self.btn_edit_keystone.active = (self.mode == self.MODE_EDIT_KEYSTONE)
 
         # Update sub-button disabled states
-        self.btn_flip_x.disabled = (self.mode != self.MODE_EDIT_SHAPE)
-        self.btn_flip_y.disabled = (self.mode != self.MODE_EDIT_SHAPE)
+        self.btn_move_flip_x.disabled = (self.mode != self.MODE_MOVE_SHAPE)
+        self.btn_move_flip_y.disabled = (self.mode != self.MODE_MOVE_SHAPE)
+        self.btn_stencil_flip_x.disabled = (self.mode != self.MODE_EDIT_STENCIL)
+        self.btn_stencil_flip_y.disabled = (self.mode != self.MODE_EDIT_STENCIL)
+        self.btn_keystone_flip_x.disabled = (self.mode != self.MODE_EDIT_KEYSTONE)
+        self.btn_keystone_flip_y.disabled = (self.mode != self.MODE_EDIT_KEYSTONE)
 
         # Restore on_corner button state
         self.btn_on_corner.text = "Corner: ON" if self.on_corner else "Corner: OFF"
@@ -7008,49 +7174,60 @@ class Hayai:
             else:
                 self.show_toast("Animation loaded", 2.0, "success")
 
-    def fit_warp(self):
+    def fit_keystone(self):
         if self.selected_shape:
-            self.selected_shape.fit_warp_to_contour()
+            self.selected_shape.fit_keystone_to_stencil()
 
-    def flip_x(self):
-        """Flip all selected items horizontally around selection center."""
+    def _flip_selected(self, axis: str, keystone_only=False, stencil_only=False):
+        """Flip all selected items around selection center.
+        axis: 'x' or 'y'
+        """
         if not self.selected_items:
             return
-
         pivot = self.get_selection_center()
         if not pivot:
             return
-
-        warp_only = (self.mode == self.MODE_EDIT_WARP)
-
         for item in self.selected_items:
             if isinstance(item, Shape):
-                item.flip_x_global(pivot, warp_only=warp_only)
+                if axis == 'x':
+                    item.flip_x_global(pivot, keystone_only=keystone_only, stencil_only=stencil_only)
+                else:
+                    item.flip_y_global(pivot, keystone_only=keystone_only, stencil_only=stencil_only)
             elif isinstance(item, Group):
-                item.flip_x(pivot, warp_only=warp_only)
+                if axis == 'x':
+                    item.flip_x(pivot, keystone_only=keystone_only, stencil_only=stencil_only)
+                else:
+                    item.flip_y(pivot, keystone_only=keystone_only, stencil_only=stencil_only)
 
-    def flip_y(self):
-        """Flip all selected items vertically around selection center."""
-        if not self.selected_items:
-            return
+    def flip_shape_x(self):
+        """Flip both stencil and keystone horizontally."""
+        self._flip_selected('x')
 
-        pivot = self.get_selection_center()
-        if not pivot:
-            return
+    def flip_shape_y(self):
+        """Flip both stencil and keystone vertically."""
+        self._flip_selected('y')
 
-        warp_only = (self.mode == self.MODE_EDIT_WARP)
+    def flip_stencil_x(self):
+        """Flip stencil only horizontally (keystone unchanged)."""
+        self._flip_selected('x', stencil_only=True)
 
-        for item in self.selected_items:
-            if isinstance(item, Shape):
-                item.flip_y_global(pivot, warp_only=warp_only)
-            elif isinstance(item, Group):
-                item.flip_y(pivot, warp_only=warp_only)
+    def flip_stencil_y(self):
+        """Flip stencil only vertically (keystone unchanged)."""
+        self._flip_selected('y', stencil_only=True)
+
+    def flip_keystone_x(self):
+        """Flip keystone only horizontally (stencil unchanged)."""
+        self._flip_selected('x', keystone_only=True)
+
+    def flip_keystone_y(self):
+        """Flip keystone only vertically (stencil unchanged)."""
+        self._flip_selected('y', keystone_only=True)
 
     def rotate(self, clockwise, degrees=90):
         if self.selected_shape:
-            # In Edit Warp mode, only transform the warp; otherwise transform both
-            warp_only = (self.mode == self.MODE_EDIT_WARP)
-            self.selected_shape.rotate(clockwise, degrees, warp_only=warp_only)
+            # In Edit Keystone mode, only transform the keystone; otherwise transform both
+            keystone_only = (self.mode == self.MODE_EDIT_KEYSTONE)
+            self.selected_shape.rotate(clockwise, degrees, keystone_only=keystone_only)
 
     def rotate_with_modifiers(self, clockwise):
         mods = pygame.key.get_mods()
@@ -7239,7 +7416,7 @@ class Hayai:
         self.shapes = []
         self.imagery_manager.clear()  # Clear all imagery items
         self.clear_selection()
-        self.current_contour = []
+        self.current_stencil = []
         self.shape_counter = 0  # Reset shape counter
         self.group_counter = 0  # Reset group counter
         self.show_toast("New scene created", 2.0, "info")
@@ -7310,14 +7487,14 @@ class Hayai:
         """Delete all selected items (shapes and groups)."""
         self.delete_selected_items()
 
-    def get_warp_point_at(self, pos):
+    def get_keystone_point_at(self, pos):
         if not self.selected_shape:
             return None
         # Convert world pos to local coords
         local_pos = self.selected_shape.get_local_point(pos[0], pos[1])
         # Use world scale for hit detection threshold
         world_scale = self.selected_shape._get_world_scale()
-        for i, wp in enumerate(self.selected_shape.warp_points):
+        for i, wp in enumerate(self.selected_shape.keystone_points):
             if math.dist(local_pos, wp) < self._hit_radius() / world_scale:
                 return i
         return None
@@ -7330,25 +7507,25 @@ class Hayai:
         local_pos = self.selected_shape.get_local_point(pos[0], pos[1])
         # Use world scale for hit detection threshold
         world_scale = self.selected_shape._get_world_scale()
-        for i, v in enumerate(self.selected_shape.contour):
+        for i, v in enumerate(self.selected_shape.stencil):
             if math.dist(local_pos, v) < self._hit_radius() / world_scale:
                 return i
         return None
 
     def get_edge_at(self, pos):
         """Find edge near position, returns (edge_start_index, closest_point_on_edge)"""
-        if not self.selected_shape or len(self.selected_shape.contour) < 2:
+        if not self.selected_shape or len(self.selected_shape.stencil) < 2:
             return None
 
         local_pos = self.selected_shape.get_local_point(pos[0], pos[1])
-        contour = self.selected_shape.contour
-        n = len(contour)
+        stencil = self.selected_shape.stencil
+        n = len(stencil)
         world_scale = self.selected_shape._get_world_scale()
         threshold = self._hit_radius() / world_scale
 
         for i in range(n):
-            p1 = contour[i]
-            p2 = contour[(i + 1) % n]
+            p1 = stencil[i]
+            p2 = stencil[(i + 1) % n]
 
             # Calculate closest point on line segment
             dx = p2[0] - p1[0]
@@ -7372,13 +7549,13 @@ class Hayai:
         """Delete the currently selected vertex"""
         if self.selected_shape and self.selected_vertex is not None:
             self.save_undo_state()
-            if len(self.selected_shape.contour) > 1:
-                del self.selected_shape.contour[self.selected_vertex]
+            if len(self.selected_shape.stencil) > 1:
+                del self.selected_shape.stencil[self.selected_vertex]
                 # Adjust selected_vertex if needed
-                if self.selected_vertex >= len(self.selected_shape.contour):
-                    self.selected_vertex = len(self.selected_shape.contour) - 1
+                if self.selected_vertex >= len(self.selected_shape.stencil):
+                    self.selected_vertex = len(self.selected_shape.stencil) - 1
                 self.hover_vertex = None
-            elif len(self.selected_shape.contour) == 1:
+            elif len(self.selected_shape.stencil) == 1:
                 # Last vertex - delete the shape
                 self.shapes.remove(self.selected_shape)
                 self.selected_shape = None
@@ -7390,7 +7567,7 @@ class Hayai:
             self.save_undo_state()
             edge_idx, point = self.hover_edge
             # Insert new vertex after edge_idx
-            self.selected_shape.contour.insert(edge_idx + 1, point)
+            self.selected_shape.stencil.insert(edge_idx + 1, point)
             self.hover_edge = None
 
     def perspective_transform(self, src_points, dst_points, point):
@@ -7427,7 +7604,7 @@ class Hayai:
 
     def draw_shape_gl(self, shape, selected=False):  # noqa: ARG002
         """Draw shape using OpenGL for proper perspective warping"""
-        if len(shape.contour) < 3:
+        if len(shape.stencil) < 3:
             return
 
         # Get image to draw from imagery manager (supports animation sync)
@@ -7435,11 +7612,11 @@ class Hayai:
         if img is None:
             img = DEFAULT_PATTERN
 
-        # Draw warped image if we have 4 warp points
-        if len(shape.warp_points) == 4:
+        # Draw textured image if we have 4 keystone points
+        if len(shape.keystone_points) == 4:
             # Get world coordinates and scale for screen
-            world_warp = shape.get_world_warp_points()
-            wp = [self.scale_point(x, y) for x, y in world_warp]
+            world_keystone = shape.get_world_keystone_points()
+            wp = [self.scale_point(x, y) for x, y in world_keystone]
 
             # Check if imagery needs per-frame texture updates (animated, capture, or video pipe)
             needs_per_frame_update = False
@@ -7456,8 +7633,8 @@ class Hayai:
                 shape.gl_texture_dirty = False
 
             # Draw shape with texture (pass alpha and HSV for color adjustments)
-            if not self.show_mask:
-                # Mask OFF: Draw warp quad directly as two triangles
+            if not self.show_stencil:
+                # Stencil OFF: Draw keystone quad directly as two triangles
                 gl_renderer.draw_textured_quad_direct(
                     shape.gl_texture_id, wp,
                     img.get_width(), img.get_height(),
@@ -7465,10 +7642,10 @@ class Hayai:
                     shape.alpha, shape.hue_shift, shape.saturation, shape.color_value
                 )
             else:
-                # Mask ON: Draw triangulated polygon with texture
-                world_contour = shape.get_world_contour()
-                scaled_contour = [self.scale_point(x, y) for x, y in world_contour]
-                triangles = triangulate_polygon(scaled_contour)
+                # Stencil ON: Draw triangulated polygon with texture
+                world_stencil = shape.get_world_stencil()
+                scaled_stencil = [self.scale_point(x, y) for x, y in world_stencil]
+                triangles = triangulate_polygon(scaled_stencil)
                 gl_renderer.draw_textured_triangles(
                     shape.gl_texture_id, triangles, wp,
                     img.get_width(), img.get_height(),
@@ -7477,27 +7654,27 @@ class Hayai:
                 )
 
     def draw_shape_overlay(self, shape, selected=False):
-        """Draw shape overlays (contours, points) to pygame surface"""
-        if len(shape.contour) < 3:
+        """Draw shape overlays (stencils, points) to pygame surface"""
+        if len(shape.stencil) < 3:
             return
 
         # Get world coordinates for rendering
-        world_contour = shape.get_world_contour()
-        world_warp = shape.get_world_warp_points()
+        world_stencil = shape.get_world_stencil()
+        world_keystone = shape.get_world_keystone_points()
 
         # Only draw geometry (verts and edges) if toggle is on and not in Play mode
         if not self.play_mode and self.show_geom:
-            # Draw contour outline (scaled from world coords)
+            # Draw stencil outline (scaled from world coords)
             outline_color = SELECTED_COLOR if selected else SHAPE_OUTLINE_COLOR
-            points = [self.scale_point(x, y) for x, y in world_contour]
+            points = [self.scale_point(x, y) for x, y in world_stencil]
             points = [(int(x), int(y)) for x, y in points]
             pygame.draw.polygon(self.ui_surface, outline_color, points, 2)
 
-            # Draw contour points (scaled from world coords)
-            for i, point in enumerate(world_contour):
+            # Draw stencil points (scaled from world coords)
+            for i, point in enumerate(world_stencil):
                 sx, sy = self.scale_point(point[0], point[1])
                 px, py = int(sx), int(sy)
-                if selected and self.mode == self.MODE_EDIT_SHAPE:
+                if selected and self.mode == self.MODE_EDIT_STENCIL:
                     # Selected vertex (persistent selection) - cyan with thick white outline
                     if i == self.selected_vertex:
                         pygame.draw.circle(self.ui_surface, (80, 200, 255), (px, py), 8)
@@ -7511,8 +7688,8 @@ class Hayai:
                 else:
                     pygame.draw.circle(self.ui_surface, POINT_COLOR, (px, py), 5)
 
-            # Draw hover indicator on edge in edit shape mode (scaled)
-            if selected and self.mode == self.MODE_EDIT_SHAPE and self.hover_edge is not None:
+            # Draw hover indicator on edge in edit stencil mode (scaled)
+            if selected and self.mode == self.MODE_EDIT_STENCIL and self.hover_edge is not None:
                 _, hover_point = self.hover_edge
                 # hover_point is in local coordinates from get_edge_at - convert to world
                 world_hover = self.selected_shape.get_world_point(hover_point[0], hover_point[1])
@@ -7523,23 +7700,23 @@ class Hayai:
                 pygame.draw.line(self.ui_surface, (255, 255, 255), (px - 6, py), (px + 6, py), 2)
                 pygame.draw.line(self.ui_surface, (255, 255, 255), (px, py - 6), (px, py + 6), 2)
 
-            # Draw warp points if selected and in edit warp mode (scaled from world coords)
+            # Draw keystone points if selected and in edit keystone mode (scaled from world coords)
             # Use squares instead of circles to differentiate from vertices
-            if selected and self.mode == self.MODE_EDIT_WARP:
-                # Draw marching ants around warp quad
-                self.draw_marching_ants_quad(world_warp)
-                for i, wp in enumerate(world_warp):
+            if selected and self.mode == self.MODE_EDIT_KEYSTONE:
+                # Draw marching ants around keystone quad
+                self.draw_marching_ants_quad(world_keystone)
+                for i, wp in enumerate(world_keystone):
                     sx, sy = self.scale_point(wp[0], wp[1])
                     px, py = int(sx), int(sy)
-                    # Draw blue squares for warp points (colorblind-friendly)
+                    # Draw blue squares for keystone points (colorblind-friendly)
                     rect = pygame.Rect(px - 7, py - 7, 14, 14)
                     pygame.draw.rect(self.ui_surface, (80, 150, 255), rect)
                     pygame.draw.rect(self.ui_surface, (255, 255, 255), rect, 2)
 
-    def draw_current_contour(self):
-        if len(self.current_contour) > 0:
-            # Scale contour points for display
-            points = [self.scale_point(x, y) for x, y in self.current_contour]
+    def draw_current_stencil(self):
+        if len(self.current_stencil) > 0:
+            # Scale stencil points for display
+            points = [self.scale_point(x, y) for x, y in self.current_stencil]
             points = [(int(x), int(y)) for x, y in points]
             if len(points) > 1:
                 pygame.draw.lines(self.ui_surface, (255, 255, 100), False, points, 2)
@@ -7548,7 +7725,7 @@ class Hayai:
             pygame.draw.line(self.ui_surface, (200, 200, 200, 150), last_point,
                            (int(self.mouse_pos[0]), int(self.mouse_pos[1])), 1)
             # Draw vertices (scaled)
-            for point in self.current_contour:
+            for point in self.current_stencil:
                 sx, sy = self.scale_point(point[0], point[1])
                 pygame.draw.circle(self.ui_surface, (255, 100, 100), (int(sx), int(sy)), 6)
 
@@ -7624,9 +7801,9 @@ class Hayai:
         for i in range(4):
             draw_dashed_line(self.ui_surface, border_color, corners[i], corners[(i + 1) % 4])
 
-    def draw_marching_ants_quad(self, world_warp: List[Tuple[float, float]]):
-        """Draw marching ants around warp quad edges"""
-        if len(world_warp) != 4:
+    def draw_marching_ants_quad(self, world_keystone: List[Tuple[float, float]]):
+        """Draw marching ants around keystone quad edges"""
+        if len(world_keystone) != 4:
             return
 
         current_time = time.time()
@@ -7634,9 +7811,9 @@ class Hayai:
         self.march_offset = (self.march_offset + elapsed * MARCH_SPEED) % (MARCH_DASH + MARCH_GAP)
         self.last_march_time = current_time
 
-        screen_warp = [self.scale_point(wp[0], wp[1]) for wp in world_warp]
+        screen_keystone = [self.scale_point(wp[0], wp[1]) for wp in world_keystone]
         for i in range(4):
-            draw_dashed_line(self.ui_surface, HANDLE_COLOR, screen_warp[i], screen_warp[(i + 1) % 4],
+            draw_dashed_line(self.ui_surface, HANDLE_COLOR, screen_keystone[i], screen_keystone[(i + 1) % 4],
                            dash_length=MARCH_DASH, gap_length=MARCH_GAP, offset=self.march_offset)
 
     def get_handle_at(self, pos: Tuple[float, float]) -> Optional[str]:
@@ -7728,10 +7905,10 @@ class Hayai:
             else:
                 pygame.draw.circle(self.ui_surface, (255, 255, 255, 40), (sx, sy), sr, 1)
 
-        # Edit Shape and Edit Warp share the same visualization logic over shape-local points
-        if self.mode in (self.MODE_EDIT_SHAPE, self.MODE_EDIT_WARP) and self.selected_shape:
+        # Edit Stencil and Edit Keystone share the same visualization logic over shape-local points
+        if self.mode in (self.MODE_EDIT_STENCIL, self.MODE_EDIT_KEYSTONE) and self.selected_shape:
             shape = self.selected_shape
-            points = shape.contour if self.mode == self.MODE_EDIT_SHAPE else shape.warp_points
+            points = shape.stencil if self.mode == self.MODE_EDIT_STENCIL else shape.keystone_points
             world_scale = shape._get_world_scale()
             radius_local = self._hit_radius() / world_scale
             screen_radius = radius_local * world_scale * avg_scale
@@ -7850,7 +8027,7 @@ class Hayai:
             subtitle_h = int(18 * self.ui_scale)
             create_sub_y = tools_panel_y + self._tp_create_subtitle_offset_y
             if create_sub_y + subtitle_h <= panel_bottom:
-                self.ui_surface.blit(self.font_small.render("Create", True, subtitle_color),
+                self.ui_surface.blit(self.font_small.render("Create Shape", True, subtitle_color),
                                      (tools_panel_x + padding, create_sub_y))
             edit_sub_y = tools_panel_y + self._tp_edit_subtitle_offset_y
             if edit_sub_y + subtitle_h <= panel_bottom:
@@ -7937,6 +8114,9 @@ class Hayai:
         border_radius = int(8 * self.ui_scale)
         slider_width = int(180 * self.ui_scale)
         header_h = self.properties_header_height
+
+        # Clear clickable source label rect (will be set if single shape is drawn)
+        self._pp_source_label_rect = None
 
         # Anchor to Imagery panel left edge
         imagery_left = self.imagery_panel.get_rect().x
@@ -8037,14 +8217,54 @@ class Hayai:
             self.name_input.rect.y = panel_y + self.name_input._panel_offset_y
             self.name_input.draw(self.ui_surface, self.font_small, self.ui_scale)
 
-            # Draw IMAGERY SOURCE section header
-            source_y = panel_y + self._pp_source_section_offset_y
-            source_header = self.font_small.render("IMAGERY SOURCE", True, (120, 120, 130))
-            self.ui_surface.blit(source_header, (panel_x + padding, source_y))
-            sep_y = source_y + int(14 * self.ui_scale)
+            # Draw STENCIL section header
+            stencil_sec_y = panel_y + self._pp_stencil_section_offset_y
+            stencil_header = self.font_small.render("STENCIL", True, (120, 120, 130))
+            self.ui_surface.blit(stencil_header, (panel_x + padding, stencil_sec_y))
+            sep_y = stencil_sec_y + int(14 * self.ui_scale)
             pygame.draw.line(self.ui_surface, (60, 60, 70),
-                           (panel_x + padding + source_header.get_width() + 8, sep_y),
+                           (panel_x + padding + stencil_header.get_width() + 8, sep_y),
                            (panel_x + padding + slider_width, sep_y))
+
+            # Draw stencil info text
+            stencil_info_y = panel_y + self._pp_stencil_info_offset_y
+            shape = selected_item
+            vert_count = len(shape.stencil)
+            vert_text = f"Verts: {vert_count}"
+            self.ui_surface.blit(self.font_small.render(vert_text, True, (160, 160, 160)),
+                                 (panel_x + padding, stencil_info_y))
+            min_x, min_y, max_x, max_y = shape.get_world_bounds()
+            min_text = f"Min: ({min_x:.0f}, {min_y:.0f})"
+            self.ui_surface.blit(self.font_small.render(min_text, True, (160, 160, 160)),
+                                 (panel_x + padding, stencil_info_y + line_height))
+            max_text = f"Max: ({max_x:.0f}, {max_y:.0f})"
+            self.ui_surface.blit(self.font_small.render(max_text, True, (160, 160, 160)),
+                                 (panel_x + padding, stencil_info_y + 2 * line_height))
+
+            # Draw IMAGERY section header
+            imagery_sec_y = panel_y + self._pp_imagery_section_offset_y
+            imagery_header = self.font_small.render("IMAGERY", True, (120, 120, 130))
+            self.ui_surface.blit(imagery_header, (panel_x + padding, imagery_sec_y))
+            sep_y = imagery_sec_y + int(14 * self.ui_scale)
+            pygame.draw.line(self.ui_surface, (60, 60, 70),
+                           (panel_x + padding + imagery_header.get_width() + 8, sep_y),
+                           (panel_x + padding + slider_width, sep_y))
+
+            # Draw clickable source label
+            source_label_y = panel_y + self._pp_source_label_offset_y
+            item = self.imagery_manager.get_item(shape.imagery_ref) if shape.imagery_ref else None
+            source_name = item.name if item else "None"
+            source_text = f"Source: {source_name}"
+            source_surf = self.font_small.render(source_text, True, (140, 170, 210) if item else (160, 160, 160))
+            self.ui_surface.blit(source_surf, (panel_x + padding, source_label_y))
+            self._pp_source_label_rect = pygame.Rect(
+                panel_x + padding, source_label_y,
+                source_surf.get_width(), source_surf.get_height())
+
+            # Draw "Modifiers" sub-label
+            modifiers_y = panel_y + self._pp_modifiers_label_offset_y
+            mod_label = self.font_small.render("Modifiers", True, (100, 100, 110))
+            self.ui_surface.blit(mod_label, (panel_x + padding, modifiers_y))
 
             # Draw KEYSTONE section header
             keystone_y = panel_y + self._pp_keystone_section_offset_y
@@ -8056,9 +8276,9 @@ class Hayai:
                            (panel_x + padding + slider_width, sep_y))
 
             # Reposition and draw Fit To Shape button
-            self.btn_fit_warp.rect.x = panel_x + self.btn_fit_warp._panel_offset_x
-            self.btn_fit_warp.rect.y = panel_y + self.btn_fit_warp._panel_offset_y
-            self.btn_fit_warp.draw(self.ui_surface, self.font_small)
+            self.btn_fit_keystone.rect.x = panel_x + self.btn_fit_keystone._panel_offset_x
+            self.btn_fit_keystone.rect.y = panel_y + self.btn_fit_keystone._panel_offset_y
+            self.btn_fit_keystone.draw(self.ui_surface, self.font_small)
 
             # Reposition and draw sliders
             for slider in self.properties_sliders:
@@ -8119,7 +8339,7 @@ class Hayai:
                 "Ctrl+U: Ungroup",
                 "Arrows: Move (Shift=10x)",
             ]
-        elif self.mode == self.MODE_EDIT_SHAPE:
+        elif self.mode == self.MODE_EDIT_STENCIL:
             mode_instructions = [
                 "Click vertex to select",
                 "Drag vertex to move",
@@ -8127,13 +8347,13 @@ class Hayai:
                 "DEL: Delete vertex",
                 "Arrows: Move vertex",
             ]
-        elif self.mode == self.MODE_EDIT_WARP:
+        elif self.mode == self.MODE_EDIT_KEYSTONE:
             mode_instructions = [
-                "Drag corners to warp",
-                "Right-drag: Rotate warp",
+                "Drag corners to adjust keystone",
+                "Right-drag: Rotate keystone",
                 "Wheel: Perspective amount",
                 "Middle-click: Switch axis",
-                "Arrows: Move warp points",
+                "Arrows: Move keystone points",
             ]
         else:
             mode_instructions = []
@@ -8201,6 +8421,9 @@ class Hayai:
                 for shape in self.shapes:
                     shape.gl_texture_id = 0
                     shape.gl_texture_dirty = True
+                pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+                pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+                pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
                 pygame.display.gl_set_attribute(pygame.GL_STENCIL_SIZE, 8)
                 self.screen = pygame.display.set_mode((WIDTH, HEIGHT),
                     pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE)
@@ -8266,8 +8489,21 @@ class Hayai:
                     continue
                 # Only handle shape-specific controls when a shape is selected
                 if self.selected_shape:
+                    # Handle click on source label → open imagery panel and highlight item
+                    if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                            and self._pp_source_label_rect
+                            and self._pp_source_label_rect.collidepoint(event.pos)):
+                        if self.selected_shape.imagery_ref:
+                            ref_item = self.imagery_manager.get_item(self.selected_shape.imagery_ref)
+                            if ref_item:
+                                self.imagery_panel.selected_item = ref_item
+                        if self.imagery_panel.collapsed:
+                            self.imagery_panel.collapsed = False
+                            self.imagery_panel.animating = True
+                            self.imagery_panel.animation_start = time.time()
+                        continue
                     # Handle properties panel buttons
-                    if self.btn_fit_warp.handle_event(event):
+                    if self.btn_fit_keystone.handle_event(event):
                         continue
                     if any(slider.handle_event(event) for slider in self.properties_sliders):
                         continue
@@ -8334,12 +8570,12 @@ class Hayai:
                 if event.key == pygame.K_ESCAPE:
                     if (self.mode == self.MODE_MAKE_SHAPE
                           and not self.placing_shape
-                          and self.current_contour):
+                          and self.current_stencil):
                         # Cancel freeform polygon in progress
-                        self.current_contour = []
+                        self.current_stencil = []
                         self.update_mode_button_states()
                         self.show_toast("Shape cancelled", 1.5)
-                    elif self.mode == self.MODE_EDIT_SHAPE and self.selected_vertex is not None:
+                    elif self.mode == self.MODE_EDIT_STENCIL and self.selected_vertex is not None:
                         # Deselect current vertex
                         self.selected_vertex = None
                     elif self.selected_shape or self.selected_items:
@@ -8383,7 +8619,7 @@ class Hayai:
                     if self.selected_items:
                         self.hierarchy_panel._start_rename()
                 elif event.key == pygame.K_DELETE:
-                    if self.mode == self.MODE_EDIT_SHAPE:
+                    if self.mode == self.MODE_EDIT_STENCIL:
                         # Only delete vertex if one is selected
                         if self.selected_vertex is not None:
                             self.delete_vertex()
@@ -8415,16 +8651,16 @@ class Hayai:
                 elif event.key == pygame.K_RETURN:
                     # Close polygon with Enter in poly drawing mode
                     if self.mode == self.MODE_MAKE_SHAPE and not self.placing_shape:
-                        if len(self.current_contour) >= 3:
+                        if len(self.current_stencil) >= 3:
                             self.save_undo_state()
-                            new_shape = Shape(contour=self.current_contour.copy())
+                            new_shape = Shape(stencil=self.current_stencil.copy())
                             new_shape.name = self.generate_shape_name()
-                            new_shape.fit_warp_to_contour()
+                            new_shape.fit_keystone_to_stencil()
                             # Auto-assign selected imagery from panel
                             if self.imagery_panel.selected_item:
                                 new_shape.imagery_ref = self.imagery_panel.selected_item.id
                             self.add_item_to_scene(new_shape)
-                            self.current_contour = []  # Clear before select_item so button states update correctly
+                            self.current_stencil = []  # Clear before select_item so button states update correctly
                             self.select_item(new_shape)
                             self.show_toast("Shape created", 1.5, "success")
                     # Activate focused button with Enter
@@ -8438,18 +8674,18 @@ class Hayai:
                         elif event.key == pygame.K_DOWN: dy = amount
                         elif event.key == pygame.K_LEFT: dx = -amount
                         elif event.key == pygame.K_RIGHT: dx = amount
-                        # In edit shape mode with selected vertex, move just the vertex
-                        if self.mode == self.MODE_EDIT_SHAPE and self.selected_shape and self.selected_vertex is not None:
+                        # In edit stencil mode with selected vertex, move just the vertex
+                        if self.mode == self.MODE_EDIT_STENCIL and self.selected_shape and self.selected_vertex is not None:
                             # Convert world delta to local delta for screen-direction movement
                             local_dx, local_dy = self.selected_shape.world_delta_to_local(dx, dy)
-                            vx, vy = self.selected_shape.contour[self.selected_vertex]
-                            self.selected_shape.contour[self.selected_vertex] = (vx + local_dx, vy + local_dy)
-                        # In edit warp mode, only move the warp points
-                        elif self.mode == self.MODE_EDIT_WARP and self.selected_shape:
+                            vx, vy = self.selected_shape.stencil[self.selected_vertex]
+                            self.selected_shape.stencil[self.selected_vertex] = (vx + local_dx, vy + local_dy)
+                        # In edit keystone mode, only move the keystone points
+                        elif self.mode == self.MODE_EDIT_KEYSTONE and self.selected_shape:
                             # Convert world delta to local delta for screen-direction movement
                             local_dx, local_dy = self.selected_shape.world_delta_to_local(dx, dy)
-                            self.selected_shape.warp_points = [
-                                (x + local_dx, y + local_dy) for x, y in self.selected_shape.warp_points
+                            self.selected_shape.keystone_points = [
+                                (x + local_dx, y + local_dy) for x, y in self.selected_shape.keystone_points
                             ]
                         else:
                             # Move all selected items (supports multi-selection and groups)
@@ -8467,13 +8703,13 @@ class Hayai:
                         # Shape placement mode (Create Regular)
                         if self.placing_shape and self.pending_shape_type == "regular":
                             self.save_undo_state()
-                            contour = self.create_regular_polygon(base_pos[0], base_pos[1],
+                            stencil = self.create_regular_polygon(base_pos[0], base_pos[1],
                                                                   self.regular_polygon_sides,
                                                                   radius=80,
                                                                   on_corner=self.on_corner)
-                            new_shape = Shape(contour=contour)
+                            new_shape = Shape(stencil=stencil)
                             new_shape.name = self.generate_shape_name()
-                            new_shape.fit_warp_to_contour()
+                            new_shape.fit_keystone_to_stencil()
                             # Auto-assign selected imagery from panel
                             if self.imagery_panel.selected_item:
                                 new_shape.imagery_ref = self.imagery_panel.selected_item.id
@@ -8484,23 +8720,23 @@ class Hayai:
                             return
                         # Free polygon drawing mode (Poly button)
                         # Check if close to start point to close shape (use scaled threshold)
-                        if len(self.current_contour) >= 3:
-                            start_scaled = self.scale_point(self.current_contour[0][0], self.current_contour[0][1])
+                        if len(self.current_stencil) >= 3:
+                            start_scaled = self.scale_point(self.current_stencil[0][0], self.current_stencil[0][1])
                             if math.dist(pos, start_scaled) < 20:
                                 # Close shape
                                 self.save_undo_state()
-                                new_shape = Shape(contour=self.current_contour.copy())
+                                new_shape = Shape(stencil=self.current_stencil.copy())
                                 new_shape.name = self.generate_shape_name()
-                                new_shape.fit_warp_to_contour()
+                                new_shape.fit_keystone_to_stencil()
                                 # Auto-assign selected imagery from panel
                                 if self.imagery_panel.selected_item:
                                     new_shape.imagery_ref = self.imagery_panel.selected_item.id
                                 self.add_item_to_scene(new_shape)
-                                self.current_contour = []  # Clear before select_item so button states update correctly
+                                self.current_stencil = []  # Clear before select_item so button states update correctly
                                 self.select_item(new_shape)
                                 self.show_toast("Shape created", 1.5, "success")
                                 return
-                        self.current_contour.append(base_pos)
+                        self.current_stencil.append(base_pos)
                         self.update_mode_button_states()
 
                     elif self.mode == self.MODE_MOVE_SHAPE:
@@ -8555,7 +8791,7 @@ class Hayai:
                                 self.marquee_end = base_pos
                                 self.marquee_active = True
 
-                    elif self.mode == self.MODE_EDIT_SHAPE:
+                    elif self.mode == self.MODE_EDIT_STENCIL:
                         # Check if clicking on a vertex to select/drag it
                         if self.hover_vertex is not None:
                             self.selected_vertex = self.hover_vertex
@@ -8564,7 +8800,7 @@ class Hayai:
                             self.selected_shape.freeze_pivot()
                             # Store drag start for delta-based dragging
                             self.drag_start_world = base_pos
-                            self.drag_start_local = self.selected_shape.contour[self.hover_vertex]
+                            self.drag_start_local = self.selected_shape.stencil[self.hover_vertex]
                             self.save_undo_state()
                             self.dragging = True
                         # Check if clicking on an edge to add a vertex
@@ -8581,21 +8817,21 @@ class Hayai:
                             if clicked_shape:
                                 self.select_item(clicked_shape)
 
-                    elif self.mode == self.MODE_EDIT_WARP:
-                        # Check for warp point drag
-                        wp_idx = self.get_warp_point_at(base_pos)
+                    elif self.mode == self.MODE_EDIT_KEYSTONE:
+                        # Check for keystone point drag
+                        wp_idx = self.get_keystone_point_at(base_pos)
                         if wp_idx is not None:
-                            self.dragging_warp_point = wp_idx
+                            self.dragging_keystone_point = wp_idx
                             # Freeze pivot to prevent center drift during editing
                             self.selected_shape.freeze_pivot()
                             # Store drag start for delta-based dragging
                             self.drag_start_world = base_pos
-                            self.drag_start_local = self.selected_shape.warp_points[wp_idx]
+                            self.drag_start_local = self.selected_shape.keystone_points[wp_idx]
                             self.save_undo_state()
                             self.dragging = True
 
                 elif event.button == 2:  # Middle click - switch perspective axis
-                    if self.selected_shape and self.mode == self.MODE_EDIT_WARP:
+                    if self.selected_shape and self.mode == self.MODE_EDIT_KEYSTONE:
                         self.selected_shape.perspective_axis = 1 - self.selected_shape.perspective_axis
 
                 elif event.button == 3:  # Right click - start rotation
@@ -8611,26 +8847,26 @@ class Hayai:
                                 base_pos[0] - center[0]
                             ))
                             self.save_undo_state()
-                    elif self.mode == self.MODE_EDIT_WARP and self.selected_shape:
-                        warp_world = self.selected_shape.get_world_warp_points()
-                        if len(warp_world) == 4:
-                            cx = sum(wp[0] for wp in warp_world) / 4
-                            cy = sum(wp[1] for wp in warp_world) / 4
-                            self.rotating_warp = True
-                            self.warp_rotate_center = (cx, cy)
-                            self.warp_rotate_start_angle = math.degrees(math.atan2(
+                    elif self.mode == self.MODE_EDIT_KEYSTONE and self.selected_shape:
+                        keystone_world = self.selected_shape.get_world_keystone_points()
+                        if len(keystone_world) == 4:
+                            cx = sum(wp[0] for wp in keystone_world) / 4
+                            cy = sum(wp[1] for wp in keystone_world) / 4
+                            self.rotating_keystone = True
+                            self.keystone_rotate_center = (cx, cy)
+                            self.keystone_rotate_start_angle = math.degrees(math.atan2(
                                 base_pos[1] - cy, base_pos[0] - cx))
                             self.save_undo_state()
 
             elif event.type == pygame.MOUSEBUTTONUP:
                 if event.button == 1:
-                    # Unfreeze pivot when done editing vertices/warp points
-                    if self.selected_shape and (self.dragging_vertex is not None or self.dragging_warp_point is not None):
+                    # Unfreeze pivot when done editing vertices/keystone points
+                    if self.selected_shape and (self.dragging_vertex is not None or self.dragging_keystone_point is not None):
                         self.selected_shape.unfreeze_pivot()
                     self.dragging = False
                     self.drag_start = None
                     self.dragging_vertex = None
-                    self.dragging_warp_point = None
+                    self.dragging_keystone_point = None
                     self.drag_start_world = None
                     self.drag_start_local = None
                     # Clear handle scaling state
@@ -8654,9 +8890,9 @@ class Hayai:
                     self.rotate_start_angle = 0.0
                     self.rotate_start_center = None
                     self.rotation_pivot_for_ui = None  # Clear stored pivot
-                    self.rotating_warp = False
-                    self.warp_rotate_start_angle = 0.0
-                    self.warp_rotate_center = None
+                    self.rotating_keystone = False
+                    self.keystone_rotate_start_angle = 0.0
+                    self.keystone_rotate_center = None
 
             elif event.type == pygame.MOUSEMOTION:
                 pos = event.pos
@@ -8664,15 +8900,15 @@ class Hayai:
                 # Convert to base coordinates for shape interactions
                 base_pos = self.unscale_point(pos[0], pos[1])
 
-                # Update hover state for edit shape mode
-                if self.mode == self.MODE_EDIT_SHAPE and not self.dragging:
+                # Update hover state for edit stencil mode
+                if self.mode == self.MODE_EDIT_STENCIL and not self.dragging:
                     self.hover_vertex = self.get_vertex_at(base_pos)
                     if self.hover_vertex is None:
                         self.hover_edge = self.get_edge_at(base_pos)
                     else:
                         self.hover_edge = None
 
-                    # Update cursor for edit shape mode
+                    # Update cursor for edit stencil mode
                     if self.hover_edge is not None:
                         pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_CROSSHAIR)
                     elif self.hover_vertex is not None:
@@ -8709,10 +8945,10 @@ class Hayai:
                             pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_SIZEALL)
                         else:
                             pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
-                elif self.mode == self.MODE_EDIT_WARP:
-                    # Check if hovering over a warp point
+                elif self.mode == self.MODE_EDIT_KEYSTONE:
+                    # Check if hovering over a keystone point
                     base_pos = self.unscale_point(pos[0], pos[1])
-                    wp_idx = self.get_warp_point_at(base_pos)
+                    wp_idx = self.get_keystone_point_at(base_pos)
                     if wp_idx is not None:
                         pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_HAND)
                     else:
@@ -8736,26 +8972,26 @@ class Hayai:
                     self.rotate_start_angle = current_angle
                     self.rotate_selection(delta_angle, center)
 
-                # Handle warp rotation (Edit Warp mode)
-                if self.rotating_warp and self.warp_rotate_center and self.selected_shape:
-                    center = self.warp_rotate_center
+                # Handle keystone rotation (Edit Keystone mode)
+                if self.rotating_keystone and self.keystone_rotate_center and self.selected_shape:
+                    center = self.keystone_rotate_center
                     current_angle = math.degrees(math.atan2(
                         base_pos[1] - center[1], base_pos[0] - center[0]))
-                    delta_angle = current_angle - self.warp_rotate_start_angle
-                    self.warp_rotate_start_angle = current_angle
+                    delta_angle = current_angle - self.keystone_rotate_start_angle
+                    self.keystone_rotate_start_angle = current_angle
 
                     angle_rad = math.radians(delta_angle)
                     cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
 
-                    new_warp_points = []
-                    for wp in self.selected_shape.warp_points:
+                    new_keystone_points = []
+                    for wp in self.selected_shape.keystone_points:
                         world_wp = self.selected_shape.get_world_point(wp[0], wp[1])
                         dx, dy = world_wp[0] - center[0], world_wp[1] - center[1]
                         new_world_x = center[0] + dx * cos_a - dy * sin_a
                         new_world_y = center[1] + dx * sin_a + dy * cos_a
                         new_local = self.selected_shape.get_local_point(new_world_x, new_world_y)
-                        new_warp_points.append(new_local)
-                    self.selected_shape.warp_points = new_warp_points
+                        new_keystone_points.append(new_local)
+                    self.selected_shape.keystone_points = new_keystone_points
 
                 if self.dragging:
                     if self.mode == self.MODE_MOVE_SHAPE and self.active_handle:
@@ -8812,23 +9048,23 @@ class Hayai:
                         self.move_selection(dx, dy)
                         self.drag_start = base_pos
 
-                    elif self.mode == self.MODE_EDIT_SHAPE and self.dragging_vertex is not None:
+                    elif self.mode == self.MODE_EDIT_STENCIL and self.dragging_vertex is not None:
                         if self.selected_shape and self.drag_start_world and self.drag_start_local:
                             # Use delta-based dragging to avoid center drift
                             world_dx = base_pos[0] - self.drag_start_world[0]
                             world_dy = base_pos[1] - self.drag_start_world[1]
                             local_dx, local_dy = self.selected_shape.world_delta_to_local(world_dx, world_dy)
                             new_local = (self.drag_start_local[0] + local_dx, self.drag_start_local[1] + local_dy)
-                            self.selected_shape.contour[self.dragging_vertex] = new_local
+                            self.selected_shape.stencil[self.dragging_vertex] = new_local
 
-                    elif self.mode == self.MODE_EDIT_WARP and self.dragging_warp_point is not None:
+                    elif self.mode == self.MODE_EDIT_KEYSTONE and self.dragging_keystone_point is not None:
                         if self.selected_shape and self.drag_start_world and self.drag_start_local:
                             # Use delta-based dragging to avoid center drift
                             world_dx = base_pos[0] - self.drag_start_world[0]
                             world_dy = base_pos[1] - self.drag_start_world[1]
                             local_dx, local_dy = self.selected_shape.world_delta_to_local(world_dx, world_dy)
                             new_local = (self.drag_start_local[0] + local_dx, self.drag_start_local[1] + local_dy)
-                            self.selected_shape.warp_points[self.dragging_warp_point] = new_local
+                            self.selected_shape.keystone_points[self.dragging_keystone_point] = new_local
 
             elif event.type == pygame.MOUSEWHEEL:
                 if self.selected_items:
@@ -8851,7 +9087,7 @@ class Hayai:
                         if center:
                             self.save_undo_state()
                             self.scale_selection(scale_factor, scale_factor, center)
-                    elif self.mode == self.MODE_EDIT_WARP and self.selected_shape:
+                    elif self.mode == self.MODE_EDIT_KEYSTONE and self.selected_shape:
                         # Adjust perspective on the selected axis
                         delta = event.y * 0.05
                         if self.selected_shape.perspective_axis == 0:
@@ -8945,9 +9181,9 @@ class Hayai:
         if self.marquee_active and self.marquee_start and self.marquee_end:
             self.draw_marquee_rect()
 
-        # Draw current contour being created
+        # Draw current stencil being created
         if self.mode == self.MODE_MAKE_SHAPE:
-            self.draw_current_contour()
+            self.draw_current_stencil()
 
         # Draw hit area visualization circles
         if self.show_hit_areas and self.show_geom and not self.play_mode:
@@ -8987,7 +9223,7 @@ class Hayai:
                 button.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
             # Draw properties panel button tooltips
             if self.selected_shape:
-                self.btn_fit_warp.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
+                self.btn_fit_keystone.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
             # Draw slider and numeric entry tooltips
             self.ui_scale_slider.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
             self.hit_area_slider.draw_tooltip(self.ui_surface, self.font_small, self.ui_scale)
@@ -9020,24 +9256,9 @@ class Hayai:
         # Draw context menu (always on top)
         self.context_menu.draw(self.ui_surface, self.font)
 
-        # Render pygame UI surface as OpenGL texture overlay (flip Y for correct orientation)
-        # Disable shader and set up fixed-function pipeline for UI overlay
-        glUseProgram(0)
-        glMatrixMode(GL_PROJECTION)
-        glLoadIdentity()
-        glOrtho(0, WIDTH, HEIGHT, 0, -1, 1)
-        glMatrixMode(GL_MODELVIEW)
-        glLoadIdentity()
-
+        # Render pygame UI surface as OpenGL texture overlay using shader-based quad
         ui_tex, _, _ = gl_renderer.surface_to_texture(self.ui_surface)
-        glEnable(GL_TEXTURE_2D)
-        glBindTexture(GL_TEXTURE_2D, ui_tex)
-        glBegin(GL_QUADS)
-        glTexCoord2f(0, 1); glVertex2f(0, 0)
-        glTexCoord2f(1, 1); glVertex2f(WIDTH, 0)
-        glTexCoord2f(1, 0); glVertex2f(WIDTH, HEIGHT)
-        glTexCoord2f(0, 0); glVertex2f(0, HEIGHT)
-        glEnd()
+        gl_renderer.draw_ui_overlay(ui_tex)
         gl_renderer.delete_texture(ui_tex)
 
         pygame.display.flip()

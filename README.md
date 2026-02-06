@@ -180,7 +180,7 @@ Hayai is designed for video projection mapping where the projector displays onto
 
 1. **Physical Setup**: Position your projector aimed at the target surface(s). Use **F11** for fullscreen on your projector output.
 2. **Create Shapes**: Click "Freeform" or "Regular" to trace the edges of physical surfaces
-3. **Fine-Tune Shapes**: Switch to "Edit Shape" mode to add, remove, or move vertices to refine your shapes
+3. **Fine-Tune Shapes**: Switch to "Modify Stencil" mode to add, remove, or move vertices to refine your shapes
 4. **Add Imagery**: Select shape(s), then expand the imagery panel (right edge or press **I**) and click + to add an image, animation, desktop capture, or video pipe - imagery is automatically assigned to the selected shape(s). You can also reassign imagery later by selecting a shape and clicking a different imagery item.
 5. **Fine-Tune Imagery**: Adjust HSV and alpha for color matching between surfaces
 6. **Keystone Correction**: Click "Edit Keystone" mode and drag the 4 corners to match the perspective of each surface
@@ -204,7 +204,7 @@ Hayai is designed for video projection mapping where the projector displays onto
 | **Freeform** | Click to place vertices, click near start or press ENTER to close, ESC to cancel |
 | **Regular** | Click to place regular polygons (3-120 sides) |
 | **Move Shape** | Select, move, rotate, scale, and manage shapes |
-| **Edit Shape** | Add, move, or delete individual vertices |
+| **Edit Stencil** | Add, move, or delete individual vertices |
 | **Edit Keystone** | Adjust the 4-corner perspective Keystone |
 
 ### Keyboard Shortcuts
@@ -243,7 +243,7 @@ Hayai is designed for video projection mapping where the projector displays onto
 | `DEL` | Delete selected |
 | `FlipX` / `FlipY` buttons | Flip horizontal / vertical |
 
-#### Edit Shape Mode
+#### Edit Stencil Mode
 | Input | Action |
 |-------|--------|
 | Click vertex | Select vertex |
@@ -260,7 +260,7 @@ Hayai is designed for video projection mapping where the projector displays onto
 | Mouse wheel | Adjust perspective amount |
 | Middle-click | Switch perspective axis (X/Y) |
 | Arrow keys | Move all Keystone points |
-| `Fit` button | Reset Keystone corners to shape bounds |
+| `Fit` button | Reset Keystone corners to stencil bounds |
 
 ### Mouse Controls Summary
 
@@ -314,7 +314,7 @@ The collapsible properties panel (press **P** or click the header) adapts to you
 The collapsible UI panel (press **U** or click the header) contains display toggles and sliders:
 
 - **Geometry** - Show/hide shape outlines and Keystone corners
-- **Mask** - Enable/disable shape masking (clipping to contour)
+- **Stencil** - Enable/disable stencil clipping (clip texture to stencil polygon)
 - **Cursor** - Show/hide system cursor
 - **Crosshair** - Show/hide cursor crosshair overlay
 - **Grid** - Show/hide background grid
