@@ -96,23 +96,33 @@ Right-click inside the Hayai folder and choose **Open Terminal Here**. Or open a
 
 This step is optional but recommended. A virtual environment is a private space for Hayai's dependencies so they don't interfere with other software on your computer. If you skip this step, the remaining steps still work the same.
 
-**Create it:** `python -m venv .venv`
-
-> On macOS/Linux, you may need to use `python3` instead of `python` for this and all following commands.
-
-**Activate it:**
-
 <details>
 <summary><strong>Windows</strong></summary>
 
-`.venv\Scripts\activate`
+```
+python -m venv .venv
+.venv\Scripts\activate
+```
 
 </details>
 
 <details>
-<summary><strong>macOS / Linux</strong></summary>
+<summary><strong>macOS</strong></summary>
 
-`source .venv/bin/activate`
+```
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+```
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
 </details>
 
@@ -123,31 +133,71 @@ You'll know it worked when your terminal prompt changes to show `(.venv)` at the
 <details>
 <summary><strong>Windows</strong></summary>
 
-`pip install -r requirements.txt`
+```
+pip install -r requirements.txt
+```
 
 This installs everything, including Windows-only features like desktop capture and video pipe.
 
 </details>
 
 <details>
-<summary><strong>macOS / Linux</strong></summary>
+<summary><strong>macOS</strong></summary>
 
-`pip install -r requirements-base.txt`
+```
+pip3 install -r requirements-base.txt
+```
 
-This installs the cross-platform dependencies. Desktop Capture and Video Pipe features are not available on macOS/Linux.
+This installs the cross-platform dependencies. Desktop Capture and Video Pipe features are not available on macOS.
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+```
+pip3 install -r requirements-base.txt
+```
+
+This installs the cross-platform dependencies. Desktop Capture and Video Pipe features are not available on Linux.
 
 </details>
 
 ### Step 6 - Run Hayai
 
-`python hayai.py`
+<details>
+<summary><strong>Windows</strong></summary>
+
+```
+python hayai.py
+```
+
+</details>
+
+<details>
+<summary><strong>macOS</strong></summary>
+
+```
+python3 hayai.py
+```
+
+</details>
+
+<details>
+<summary><strong>Linux</strong></summary>
+
+```
+python3 hayai.py
+```
+
+</details>
 
 The Hayai window should appear. You're ready to go!
 
 ### Troubleshooting
 
-- **`python` is not recognized / not found** - Python wasn't added to your system PATH. On Windows, re-run the Python installer and check "Add Python to PATH". On macOS/Linux, try `python3` instead.
-- **`pip` is not recognized / not found** - Try `python -m pip install -r requirements.txt` instead.
+- **`python` is not recognized / not found** - Python wasn't added to your system PATH. On Windows, re-run the Python installer and check "Add Python to PATH". On macOS/Linux, use `python3` instead of `python`.
+- **`pip` is not recognized / not found** - On macOS/Linux, use `pip3` instead of `pip`. If that doesn't work, try `python3 -m pip install -r requirements-base.txt`. On Windows, try `python -m pip install -r requirements.txt`.
 - **Permission errors on macOS/Linux** - Don't use `sudo`. Make sure you're inside an activated virtual environment (Step 4).
 
 ### Dependencies
@@ -178,14 +228,18 @@ Hayai is designed for video projection mapping where the projector displays onto
 
 ### Workflow
 
-1. **Physical Setup**: Position your projector aimed at the target surface(s). Use **F11** for fullscreen on your projector output.
+1. **Physical Setup**: Position your projector aimed at the target surface(s).
+   - **Turn Off Keystoning**: Turn off any in-projector keystone corrections.
+   - **Set Focus**: Set any focus control to be in the center of the surfaces.
+   - **Go Fullscreen**: Use **F11** for fullscreen on your projector output.
 2. **Create Shapes**: Click "Freeform" or "Regular" to trace the edges of physical surfaces
-3. **Fine-Tune Shapes**: Switch to "Modify Stencil" mode to add, remove, or move vertices to refine your shapes
-4. **Add Imagery**: Select shape(s), then expand the imagery panel (right edge or press **I**) and click + to add an image, animation, desktop capture, or video pipe - imagery is automatically assigned to the selected shape(s). You can also reassign imagery later by selecting a shape and clicking a different imagery item.
-5. **Fine-Tune Imagery**: Adjust HSV and alpha for color matching between surfaces
-6. **Keystone Correction**: Click "Edit Keystone" mode and drag the 4 corners to match the perspective of each surface
-7. **Fine-Tune Keystone Correction**: In the Properties panel edit the Perspective X and Perspective Y sliders to adjust more extreme perpsective effects. You can also use the mouse wheel to adjust these values and mouse middle click to switch between adjusting perspective X and Perspective Y.
-8. **Go Live**: Press **SPACE** to hide the UI and show only your mapped content.
+   - **Fine-Tune Shapes**: Switch to "Modify Stencil" mode to add, remove, or move vertices to refine your shapes
+3. **Add Imagery**: Select shape(s), then expand the imagery panel (right edge or press **I**) and click + to add an image, animation, desktop capture, or video pipe - imagery is automatically assigned to the selected shape(s). You can also reassign imagery later by selecting a shape and clicking a different imagery item.
+   - **Fine-Tune Imagery**: Adjust HSV and alpha for color matching between surfaces
+4. **Set Keystoning**: Click "Edit Keystone" mode and drag the 4 corners to match the perspective of each surface. AKA Keystone correction.
+   - **Fine-Tune the Keystone Correction**: In the Properties panel edit the Perspective X and Perspective Y sliders to adjust more extreme perpsective effects. You can also use the mouse wheel to adjust these values and mouse middle click to switch between adjusting perspective X and Perspective Y.
+5. **Complete Your Scene**: Repeat steps 2,3,4 until the scene is complete.
+6. **Go Live**: Press **SPACE** to hide the UI and show only your mapped content.
 
 ### Tips for Live Performance
 
