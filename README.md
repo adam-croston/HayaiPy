@@ -63,7 +63,7 @@ Verify with `python3 --version`.
 
 ### Step 2 - Download Hayai
 
-1. Go to the [Hayai GitHub page](https://github.com/acroston/HayaiPY).
+1. Go to the [Hayai GitHub page](https://github.com/adam-croston/HayaiPy).
 2. Click the green **Code** button near the top-right.
 3. Click **Download ZIP**.
 4. Find the downloaded `.zip` file (usually in your Downloads folder), right-click it, and **extract** (unzip) it to a location of your choice. This creates a folder with all of Hayai's files inside.
