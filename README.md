@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="Docs/logo.png" alt="Hayai Logo">
+</p>
+
 # Hayai v1.1
 
 **Rapid Video Projection Mapping for Everyone**
