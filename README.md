@@ -25,7 +25,7 @@ Hayai is a fast, free, and beginner-friendly projection mapping tool with perspe
 ## Installation
 
 > **Primary platform: Windows.**
-- Core features (shape creation, texture mapping, animations) should work on macOS and Linux but **have not been tested**.
+- Core features (shape creation, texture mapping, animations) should work on MacOS and Linux but **have not been tested**.
 - Desktop Capture and Video Pipe (Spout) features **currently requires Windows**.
 
 ### Step 1 - Install Python
@@ -33,7 +33,7 @@ Hayai is a fast, free, and beginner-friendly projection mapping tool with perspe
 You need Python 3.10 or higher. If you already have it, skip to Step 2.
 
 <details>
-<summary><strong>Windows</strong></summary>
+<summary><strong>For Windows</strong></summary>
 
 1. Go to [python.org/downloads](https://www.python.org/downloads/) and click the big yellow download button.
 2. Run the installer. **Important: check the "Add Python to PATH" box** at the bottom of the first screen before clicking Install.
@@ -42,9 +42,9 @@ You need Python 3.10 or higher. If you already have it, skip to Step 2.
 </details>
 
 <details>
-<summary><strong>macOS</strong></summary>
+<summary><strong>For MacOS</strong></summary>
 
-1. Go to [python.org/downloads](https://www.python.org/downloads/) and download the macOS installer.
+1. Go to [python.org/downloads](https://www.python.org/downloads/) and download the MacOS installer.
 2. Run the `.pkg` file and follow the prompts.
 3. Open Terminal (Applications > Utilities > Terminal) and type `python3 --version`. You should see something like `Python 3.12.x`.
 
@@ -53,7 +53,7 @@ You need Python 3.10 or higher. If you already have it, skip to Step 2.
 </details>
 
 <details>
-<summary><strong>Linux</strong></summary>
+<summary><strong>For Linux</strong></summary>
 
 Open a terminal and run `sudo apt install python3 python3-venv python3-pip`. *(If you're not on Ubuntu/Debian, use your distribution's package manager.)*
 
@@ -73,7 +73,7 @@ Verify with `python3 --version`.
 You need a terminal (also called "command prompt") open inside the folder you just extracted.
 
 <details>
-<summary><strong>Windows</strong></summary>
+<summary><strong>For Windows</strong></summary>
 
 1. Open the extracted Hayai folder in File Explorer.
 2. Click the **address bar** at the top (where it shows the folder path).
@@ -82,7 +82,7 @@ You need a terminal (also called "command prompt") open inside the folder you ju
 </details>
 
 <details>
-<summary><strong>macOS</strong></summary>
+<summary><strong>For MacOS</strong></summary>
 
 1. Open **Terminal** (Applications > Utilities > Terminal).
 2. Type `cd ` (with a space after it), then **drag the Hayai folder** from Finder into the Terminal window. Press **Enter**.
@@ -90,18 +90,18 @@ You need a terminal (also called "command prompt") open inside the folder you ju
 </details>
 
 <details>
-<summary><strong>Linux</strong></summary>
+<summary><strong>For Linux</strong></summary>
 
 Right-click inside the Hayai folder and choose **Open Terminal Here**. Or open a terminal and type `cd /path/to/HayaiPY` (substituting the actual path).
 
 </details>
 
-### Step 4 - Set Up a Virtual Environment (Optional)
+### Step 4 - (OPTIONAL) Set Up a Virtual Environment
 
 This step is optional but recommended. A virtual environment is a private space for Hayai's dependencies so they don't interfere with other software on your computer. If you skip this step, the remaining steps still work the same.
 
 <details>
-<summary><strong>Windows</strong></summary>
+<summary><strong>For Windows</strong></summary>
 
 ```
 python -m venv .venv
@@ -111,7 +111,7 @@ python -m venv .venv
 </details>
 
 <details>
-<summary><strong>macOS</strong></summary>
+<summary><strong>For MacOS</strong></summary>
 
 ```
 python3 -m venv .venv
@@ -121,7 +121,7 @@ source .venv/bin/activate
 </details>
 
 <details>
-<summary><strong>Linux</strong></summary>
+<summary><strong>For Linux</strong></summary>
 
 ```
 python3 -m venv .venv
@@ -135,42 +135,80 @@ You'll know it worked when your terminal prompt changes to show `(.venv)` at the
 ### Step 5 - Install Dependencies
 
 <details>
-<summary><strong>Windows</strong></summary>
+<summary><strong>For Windows</strong></summary>
 
+Single Step:
 ```
 pip install -r requirements.txt
 ```
-
 This installs everything, including Windows-only features like desktop capture and video pipe.
 
+If that does not work, install the dependencies one by one (Mullti-step).
+
+Multi-step:
+```
+pip install numpy>=2.2.6
+pip install opencv-python>=4.11.0.86
+pip install pillow>=12.1.0
+pip install pygame-ce>=2.5.0
+pip install PyOpenGL>=3.1.10
+pip install PyOpenGL-accelerate>=3.1.10
+pip install mss>=9.0.0
+pip install pywin32>=306
+pip install SpoutGL>=0.0.4
+```
 </details>
 
 <details>
-<summary><strong>macOS</strong></summary>
+<summary><strong>For MacOS</strong></summary>
 
+Single Step:
 ```
 pip3 install -r requirements-base.txt
 ```
 
-This installs the cross-platform dependencies. Desktop Capture and Video Pipe features are not available on macOS.
+This installs the cross-platform dependencies. Desktop Capture and Video Pipe features are not available on MacOS.
 
+If that does not work, install the dependencies one by one (Mullti-step).
+
+Multi-step:
+```
+pip install numpy>=2.2.6
+pip install opencv-python>=4.11.0.86
+pip install pillow>=12.1.0
+pip install pygame-ce>=2.5.0
+pip install PyOpenGL>=3.1.10
+pip install PyOpenGL-accelerate>=3.1.10
+```
 </details>
 
 <details>
-<summary><strong>Linux</strong></summary>
+<summary><strong>For Linux</strong></summary>
 
+Single Step:
 ```
 pip3 install -r requirements-base.txt
 ```
 
 This installs the cross-platform dependencies. Desktop Capture and Video Pipe features are not available on Linux.
 
+If that does not work, install the dependencies one by one (Mullti-step).
+
+Multi-step:
+```
+pip install numpy>=2.2.6
+pip install opencv-python>=4.11.0.86
+pip install pillow>=12.1.0
+pip install pygame-ce>=2.5.0
+pip install PyOpenGL>=3.1.10
+pip install PyOpenGL-accelerate>=3.1.10
+```
 </details>
 
 ### Step 6 - Run Hayai
 
 <details>
-<summary><strong>Windows</strong></summary>
+<summary><strong>For Windows</strong></summary>
 
 ```
 python hayai.py
@@ -179,7 +217,7 @@ python hayai.py
 </details>
 
 <details>
-<summary><strong>macOS</strong></summary>
+<summary><strong>For MacOS</strong></summary>
 
 ```
 python3 hayai.py
@@ -188,7 +226,7 @@ python3 hayai.py
 </details>
 
 <details>
-<summary><strong>Linux</strong></summary>
+<summary><strong>For Linux</strong></summary>
 
 ```
 python3 hayai.py
@@ -200,9 +238,9 @@ The Hayai window should appear. You're ready to go!
 
 ### Troubleshooting
 
-- **`python` is not recognized / not found** - Python wasn't added to your system PATH. On Windows, re-run the Python installer and check "Add Python to PATH". On macOS/Linux, use `python3` instead of `python`.
-- **`pip` is not recognized / not found** - On macOS/Linux, use `pip3` instead of `pip`. If that doesn't work, try `python3 -m pip install -r requirements-base.txt`. On Windows, try `python -m pip install -r requirements.txt`.
-- **Permission errors on macOS/Linux** - Don't use `sudo`. Make sure you're inside an activated virtual environment (Step 4).
+- **`python` is not recognized / not found** - Python wasn't added to your system PATH. On Windows, re-run the Python installer and check "Add Python to PATH". On MacOS/Linux, use `python3` instead of `python`.
+- **`pip` is not recognized / not found** - On MacOS/Linux, use `pip3` instead of `pip`. If that doesn't work, try `python3 -m pip install -r requirements-base.txt`. On Windows, try `python -m pip install -r requirements.txt`.
+- **Permission errors on MacOS/Linux** - Don't use `sudo`. Make sure you're inside an activated virtual environment (Step 4).
 
 ### Dependencies
 
